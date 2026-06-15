@@ -113,7 +113,9 @@ def _resolve_external_model_arch(package_name):
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(entry, list):
-                    return entry[0].__name__
+                    if entry:
+                        return entry[0].__name__
+                    continue
                 return entry.__name__
     return None
 
@@ -869,7 +871,7 @@ def _compute_genrm_server_args(
     base = _to_local_gpu_id(base)
 
     kwargs = {
-        "model_path": os.path.normpath(args.args.genrm_model_path),
+        "model_path": os.path.normpath(args.genrm_model_path),
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
