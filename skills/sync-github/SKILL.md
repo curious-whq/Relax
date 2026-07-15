@@ -48,6 +48,8 @@ Prompt A / Prompt B 都靠 `git cherry-pick -x` 留下的 `(cherry picked from c
 - 不要运行需要 GPU 的代码或测试。
 - 已跟踪文件有本地改动时停止；只有未跟踪文件时，记录路径并继续原流程。不要删除、stage、stash、clean 未跟踪文件。
 - 如果缺少 `gitleaks`，先读 [references/gitleaks.md](references/gitleaks.md)，确认安装方案后再继续。
+- Prompt A 中如果某个 external commit 已被内部以 exact SHA、patch-id、commit message、人审等方式等价合入或修正版合入，必须把整个 external commit 记录为已吸收/跳过；禁止按残余 tree diff 部分重放它。
+  - 典型例子：外部 PR 加了 `init_tracking(args)`，但内部已将其修正为 `serve.start()` 后初始化；此时外部原 commit 整体跳过，不能重新加入较早位置的调用。
 
 ## 工作区检查
 
