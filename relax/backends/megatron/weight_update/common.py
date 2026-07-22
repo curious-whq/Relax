@@ -37,9 +37,13 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
 
     if ".experts." in name:
         tp_size = mpu.get_expert_tensor_parallel_world_size()
+        if tp_size == 1:
+            return param.data
         tp_group = mpu.get_expert_tensor_parallel_group()
     else:
         tp_size = mpu.get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return param.data
         tp_group = mpu.get_tensor_model_parallel_group()
 
     # NOTE(wuhuan): qwen3.5 GDN
@@ -149,9 +153,17 @@ def all_gather_params_async(
             # Start async all_gather
             if ".experts." in info.name:
                 tp_size = mpu.get_expert_tensor_parallel_world_size()
+                if tp_size == 1:
+                    gather_tasks.append((info, param.data, None, None, None))
+                    handles.append(None)
+                    continue
                 tp_group = mpu.get_expert_tensor_parallel_group()
             else:
                 tp_size = mpu.get_tensor_model_parallel_world_size()
+                if tp_size == 1:
+                    gather_tasks.append((info, param.data, None, None, None))
+                    handles.append(None)
+                    continue
                 tp_group = mpu.get_tensor_model_parallel_group()
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
