@@ -10,7 +10,7 @@ cd "${SCRIPT_DIR}"
 # (memory id f3c6b412): OpenAI SDK normalises, but if any client
 # does f"{base_url}/chat/completions" you get a double-slash 404.
 export OPENAI_BASE_URL="${RELAX_BASE_URL%/}"
-export OPENAI_API_KEY="${RELAX_SESSION_ID}"
+export OPENAI_API_KEY="${RELAX_API_KEY:-${RELAX_SESSION_ID}}"
 
 # Per-session stdout+stderr capture. Relax captures the subprocess streams
 # into a tmpdir/command.log and only surfaces it when the agent exits with

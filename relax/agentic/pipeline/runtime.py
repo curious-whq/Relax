@@ -8,6 +8,7 @@ import copy
 import functools
 import json
 import os
+import secrets
 import signal
 import tempfile
 import threading
@@ -42,6 +43,11 @@ from relax.agentic.profile import (
     merge_agentic_trace,
 )
 from relax.agentic.runner.ipc import LauncherClient, ensure_local_launcher_daemon
+from relax.agentic.session.contracts import (
+    AgenticIdentity,
+    SessionControlRef,
+    SessionRegistrationGrant,
+)
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     TrainingFieldArtifact,
@@ -146,6 +152,7 @@ class AgentExecutionError(RuntimeError):
 @dataclass(frozen=True)
 class SessionInput:
     session_id: str
+    api_key: str = field(repr=False)
     rollout_mode: str
     group_id: str
     input_payload: dict[str, Any] = field(default_factory=dict)
@@ -268,6 +275,8 @@ async def execute_managed_session_input(
         env.update(
             {
                 "RELAX_SESSION_ID": session_input.session_id,
+                "RELAX_API_KEY": session_input.api_key,
+                "OPENAI_API_KEY": session_input.api_key,
                 "RELAX_ROLLOUT_MODE": session_input.rollout_mode,
                 "RELAX_GROUP_ID": session_input.group_id,
                 "RELAX_SESSION_IO_DIR": str(tmpdir_path),
@@ -409,6 +418,7 @@ def _managed_spec_from_payload(payload: dict[str, Any]) -> ManagedCommandAppSpec
 def _session_input_to_payload(session_input: SessionInput) -> dict[str, Any]:
     return {
         "session_id": session_input.session_id,
+        "api_key": session_input.api_key,
         "group_id": session_input.group_id,
         "rollout_mode": session_input.rollout_mode,
         "input_payload": dict(session_input.input_payload),
@@ -418,12 +428,14 @@ def _session_input_to_payload(session_input: SessionInput) -> dict[str, Any]:
 
 def _session_input_from_payload(payload: dict[str, Any]) -> SessionInput:
     session_id = payload["session_id"]
+    api_key = payload["api_key"]
     group_id = payload["group_id"]
     rollout_mode = payload["rollout_mode"]
     input_payload = payload["input_payload"]
     metadata = payload["metadata"]
     return SessionInput(
         session_id=session_id,
+        api_key=api_key,
         group_id=group_id,
         rollout_mode=rollout_mode,
         input_payload=dict(input_payload),
@@ -1377,21 +1389,39 @@ class _ServeHandleChatControlClient:
     async def finalize_and_discard(
         self,
         *,
-        session_id: str,
+        control_ref: SessionControlRef,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
     ) -> FinalizedResultTransport:
         return await self._handle.finalize_and_discard.remote(
-            session_id=session_id,
+            control_ref=control_ref,
             metadata=metadata,
             reward=reward,
         )
 
-    async def discard_session(self, *, session_id: str) -> bool:
-        return await self._handle.discard_session.remote(session_id=session_id)
+    async def discard_session(self, *, control_ref: SessionControlRef) -> bool:
+        return await self._handle.discard_session.remote(control_ref=control_ref)
 
-    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> int:
-        return int(await self._handle.register_sessions_batch.remote(entries=entries))
+    async def register_sessions_batch(
+        self,
+        *,
+        entries: list[dict[str, Any]],
+    ) -> list[SessionRegistrationGrant]:
+        payloads = await self._handle.register_sessions_batch.remote(entries=entries)
+        grants: list[SessionRegistrationGrant] = []
+        for payload in payloads:
+            grants.append(
+                SessionRegistrationGrant(
+                    control_ref=SessionControlRef(
+                        program_owner_key=payload["program_owner_key"],
+                        engine_session_id=payload["engine_session_id"],
+                        owner_epoch=payload["owner_epoch"],
+                    ),
+                    credential=payload["credential"],
+                    event_seq=payload["event_seq"],
+                )
+            )
+        return grants
 
     async def release_partial_resume_gate(self, *, rollout_id: int) -> int:
         return int(await self._handle.release_partial_resume_gate.remote(rollout_id=rollout_id))
@@ -1525,6 +1555,9 @@ class RuntimeDomain:
         self._runtime_session_counter = 0
         self._runtime_request_counter = 0
         self._notified_session_rollouts: dict[str, int] = {}
+        self._session_identities: dict[str, AgenticIdentity] = {}
+        self._session_registration_nonces: dict[str, str] = {}
+        self._session_registration_grants: dict[str, SessionRegistrationGrant] = {}
         self._rollout_mode = "train"
         self._runtime_resources = get_agentic_runtime_resources(args)
         self._session_runner_pool_lock = threading.Lock()
@@ -1666,7 +1699,10 @@ class RuntimeDomain:
         release_handles = [slot.managed_session_handle for slot in release_slots]
         await self._set_managed_session_timeouts_active(release_handles, active=False)
         finalize_client = self._ensure_service_client()
-        discard_tasks = [finalize_client.discard_session(session_id=slot.session_id) for slot in slots]
+        discard_tasks = [
+            finalize_client.discard_session(control_ref=self._control_ref_for_session(session_id=slot.session_id))
+            for slot in slots
+        ]
         results = await asyncio.gather(*discard_tasks, return_exceptions=True)
         failed_results: list[tuple[str, BaseException]] = []
         for slot, result in zip(slots, results, strict=True):
@@ -1851,7 +1887,7 @@ class RuntimeDomain:
         return "slot_completed" if materialized_records or discarded_group_keys else None
 
     def _clear_local_session_state(self, *, session_id: str) -> None:
-        self._notified_session_rollouts.pop(session_id, None)
+        self._clear_session_registration(session_id=session_id)
         for request_id, slot in list(self.runtime_slots_by_request_id.items()):
             if slot.session_id == session_id:
                 self._drop_runtime_slot(request_id)
@@ -2308,7 +2344,10 @@ class RuntimeDomain:
         if not ordered_session_ids:
             return 0
         finalize_client = self._ensure_service_client()
-        discard_tasks = [finalize_client.discard_session(session_id=session_id) for session_id in ordered_session_ids]
+        discard_tasks = [
+            finalize_client.discard_session(control_ref=self._control_ref_for_session(session_id=session_id))
+            for session_id in ordered_session_ids
+        ]
         results = await asyncio.gather(*discard_tasks, return_exceptions=True)
         cleaned_count = 0
         cleaned_session_ids: set[str] = set()
@@ -2366,8 +2405,9 @@ class RuntimeDomain:
         mark_agentic_event(framework_events, "managed_session_runner_end_at")
         finalize_client = self._ensure_service_client()
         mark_agentic_event(framework_events, "managed_finalize_request_start_at")
+        session_id = result_payload["_session_id"]
         transport = await finalize_client.finalize_and_discard(
-            session_id=result_payload["_session_id"],
+            control_ref=self._control_ref_for_session(session_id=session_id),
             metadata=copy.deepcopy(finalize_metadata),
             reward=result_payload["reward"],
         )
@@ -2418,8 +2458,12 @@ class RuntimeDomain:
             raise ValueError("Managed agentic request requires envelope.session_id")
         if envelope.seed.group_index is None:
             raise ValueError("Managed agentic request requires envelope.seed.group_index")
+        grant = self._session_registration_grants.get(envelope.session_id)
+        if grant is None:
+            raise RuntimeError(f"Managed agentic session {envelope.session_id!r} has no registration grant")
         return SessionInput(
             session_id=envelope.session_id,
+            api_key=grant.credential,
             group_id=str(envelope.seed.group_index),
             rollout_mode=self._rollout_mode,
             input_payload=copy.deepcopy(envelope.input_payload),
@@ -2432,9 +2476,41 @@ class RuntimeDomain:
         session_id = envelope.session_id
         if isinstance(session_id, str) and session_id:
             return session_id
-        generated = f"agentic_session_{self._runtime_session_counter}_{seed_sample.group_index}_{slot_idx}"
+        generated = f"agentic_session_{uuid4().hex}"
         self._runtime_session_counter += 1
         return generated
+
+    def _identity_for_session(self, *, session_id: str) -> AgenticIdentity:
+        identity = self._session_identities.get(session_id)
+        if identity is None:
+            identity = AgenticIdentity(
+                program_id=f"program_{uuid4().hex}",
+                program_owner_key=f"program_owner_{uuid4().hex}",
+                root_session_id=f"root_session_{uuid4().hex}",
+                engine_session_id=session_id,
+                parent_engine_session_id=None,
+            )
+            self._session_identities[session_id] = identity
+        return identity
+
+    def _registration_nonce_for_session(self, *, session_id: str) -> str:
+        nonce = self._session_registration_nonces.get(session_id)
+        if nonce is None:
+            nonce = secrets.token_hex(32)
+            self._session_registration_nonces[session_id] = nonce
+        return nonce
+
+    def _control_ref_for_session(self, *, session_id: str) -> SessionControlRef:
+        grant = self._session_registration_grants.get(session_id)
+        if grant is None:
+            raise RuntimeError(f"Managed agentic session {session_id!r} has no control reference")
+        return grant.control_ref
+
+    def _clear_session_registration(self, *, session_id: str) -> None:
+        self._notified_session_rollouts.pop(session_id, None)
+        self._session_identities.pop(session_id, None)
+        self._session_registration_nonces.pop(session_id, None)
+        self._session_registration_grants.pop(session_id, None)
 
     def _request_id_for(self, *, envelope: RequestEnvelope, session_id: str) -> str:
         if isinstance(envelope.request_id, str) and envelope.request_id:
@@ -2472,13 +2548,22 @@ class RuntimeDomain:
         if not pending_entries:
             return
         client = self._ensure_service_client()
-        registered = await client.register_sessions_batch(entries=pending_entries)
-        if registered != len(pending_entries):
+        grants = await client.register_sessions_batch(entries=pending_entries)
+        if len(grants) != len(pending_entries):
             raise RuntimeError(
-                f"Managed session registration mismatch: expected {len(pending_entries)}, got {registered}"
+                f"Managed session registration mismatch: expected {len(pending_entries)}, got {len(grants)}"
             )
+        grants_by_session_id = {grant.control_ref.engine_session_id: grant for grant in grants}
         for entry in pending_entries:
-            self._notified_session_rollouts[entry["session_id"]] = entry["rollout_id"]
+            session_id = entry["session_id"]
+            grant = grants_by_session_id.get(session_id)
+            if grant is None:
+                raise RuntimeError(f"Managed session registration omitted session {session_id!r}")
+            identity = self._session_identities.get(session_id)
+            if identity is None or grant.control_ref.program_owner_key != identity.program_owner_key:
+                raise RuntimeError(f"Managed session registration returned an invalid owner for {session_id!r}")
+            self._session_registration_grants[session_id] = grant
+            self._notified_session_rollouts[session_id] = entry["rollout_id"]
         await self._refresh_session_debug_state(client=client)
 
     def has_pending_runtime_work(self) -> bool:
@@ -2668,8 +2753,8 @@ class RuntimeDomain:
             managed_session_handles.append(managed_session_handle)
         return managed_session_handles
 
-    @staticmethod
     def _prepare_request_registration_entries(
+        self,
         request_plans: list[Any],
         *,
         scope_id: str,
@@ -2679,14 +2764,21 @@ class RuntimeDomain:
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for request_plan in request_plans:
+            session_id = request_plan.envelope.session_id
+            if not isinstance(session_id, str) or not session_id:
+                raise RuntimeError("rollout-managed session registration requires a non-empty session_id")
             group_index = request_plan.envelope.seed.group_index
             if group_index is None:
                 raise RuntimeError(
                     "rollout-managed session registration requires envelope.seed.group_index to be populated"
                 )
+            identity = self._identity_for_session(session_id=session_id)
             entries.append(
                 {
-                    "session_id": request_plan.envelope.session_id,
+                    "session_id": session_id,
+                    "identity": identity.to_payload(),
+                    "credential_nonce": self._registration_nonce_for_session(session_id=session_id),
+                    "event_id": f"engine_session_open:{identity.engine_session_id}",
                     "scope_id": scope_id,
                     "rollout_id": request_plan.envelope.rollout_id
                     if request_plan.envelope.rollout_id is not None
@@ -2832,9 +2924,13 @@ class RuntimeDomain:
                 finalize_client = None
             if finalize_client is not None:
                 discard_tasks = [
-                    finalize_client.discard_session(session_id=request_plan.session_id)
+                    finalize_client.discard_session(
+                        control_ref=self._control_ref_for_session(session_id=request_plan.session_id)
+                    )
                     for request_plan in all_request_plans
-                    if isinstance(request_plan.session_id, str) and request_plan.session_id
+                    if isinstance(request_plan.session_id, str)
+                    and request_plan.session_id
+                    and request_plan.session_id in self._session_registration_grants
                 ]
                 if discard_tasks:
                     await asyncio.gather(*discard_tasks, return_exceptions=True)
@@ -2879,7 +2975,10 @@ class RuntimeDomain:
             raise RuntimeError("Failed to create finalize client during runtime shutdown session cleanup") from exc
         ordered_session_ids = sorted(session_ids)
         results = await asyncio.gather(
-            *(finalize_client.discard_session(session_id=session_id) for session_id in ordered_session_ids),
+            *(
+                finalize_client.discard_session(control_ref=self._control_ref_for_session(session_id=session_id))
+                for session_id in ordered_session_ids
+            ),
             return_exceptions=True,
         )
         cleaned_count = 0
@@ -2934,6 +3033,9 @@ class RuntimeDomain:
         self.session_debug_state = None
         self.managed_chat_api_base_url = None
         self._notified_session_rollouts.clear()
+        self._session_identities.clear()
+        self._session_registration_nonces.clear()
+        self._session_registration_grants.clear()
 
     async def wait_for_next_runtime_slot(self, *, timeout_s: float | None = None) -> str | None:
         if self._ready_materialized_batches:
@@ -3007,7 +3109,7 @@ class RuntimeDomain:
             envelope=dispatch_context.envelope,
             result_transport=result_transport,
         )
-        self._notified_session_rollouts.pop(session_id, None)
+        self._clear_session_registration(session_id=session_id)
         return {
             "rollout_id": dispatch_context.rollout_id,
             "group_key": dispatch_context.group_key,

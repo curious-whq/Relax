@@ -86,7 +86,8 @@ Relax runs the command under `--agent-cwd` and injects these environment variabl
 | `RELAX_OUTPUT_JSON` | Optional output JSON file path inside `RELAX_SESSION_IO_DIR`. |
 | `RELAX_SESSION_IO_DIR` | Per-session temporary IO directory. |
 | `RELAX_BASE_URL` | Base URL of the Relax OpenAI-compatible chat API. |
-| `RELAX_SESSION_ID` | Session id; commonly used as the OpenAI API key. |
+| `RELAX_SESSION_ID` | Internal engine-session id; safe to use for session-local logging. |
+| `RELAX_API_KEY` | Opaque credential for authenticating to the managed Chat API. |
 | `RELAX_ROLLOUT_MODE` | `train` or `eval`. |
 | `RELAX_GROUP_ID` | Runtime group id for this session. |
 
@@ -96,10 +97,14 @@ A launch script usually adapts these variables to whatever the agent already exp
 #!/usr/bin/env bash
 
 export OPENAI_BASE_URL="${RELAX_BASE_URL}"
-export OPENAI_API_KEY="${RELAX_SESSION_ID}"
+export OPENAI_API_KEY="${RELAX_API_KEY:-${RELAX_SESSION_ID}}"
 
 python -m my_agent --arg1 val1 --arg2 val2
 ```
+
+The `RELAX_SESSION_ID` fallback only keeps the launch script compatible with older Relax runtimes. The current
+managed runtime always provides `RELAX_API_KEY`, and the current Chat API does not accept a session id as a
+credential.
 
 For an agent that expects explicit session file paths:
 

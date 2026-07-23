@@ -7,6 +7,7 @@ import copy
 import ctypes
 import hashlib
 import json
+import secrets
 import threading
 import time
 import zlib
@@ -36,6 +37,7 @@ from relax.agentic.profile import (
     mark_agentic_event_once,
     mark_metadata_agentic_event,
 )
+from relax.agentic.session.contracts import AgenticIdentity, SessionControlRef
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
@@ -59,10 +61,15 @@ logger = get_logger(__name__)
 AGENTIC_SESSION_SHARD_NAME_PREFIX = "agentic_session_shard"
 _DEFAULT_SESSION_SHARD_COUNT = 16
 _STALE_SESSION_SHARD_CLEANUP_LIMIT = 64
+_TERMINATED_PROGRAM_TOMBSTONE_LIMIT = 8192
 _AGENTIC_SHARD_ALLOCATOR_ENV = {
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "0",
 }
+_AGENTIC_CREDENTIAL_VERSION = "relax-v1"
+_AGENTIC_CREDENTIAL_NONCE_HEX_LENGTH = 64
+_AGENTIC_CREDENTIAL_SHARD_DIGITS_MAX = 5
+_AGENTIC_CREDENTIAL_EPOCH_DIGITS_MAX = 19
 
 
 def agentic_session_shard_name(index: int) -> str:
@@ -142,6 +149,21 @@ class _SessionRecord:
     pending_chat_waiters: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
     gate_reason: str | None = None
     protected_until_finalize: bool = False
+    identity: AgenticIdentity | None = None
+    credential_digest: str | None = None
+
+
+@dataclass
+class _ProgramRecord:
+    program_id: str
+    program_owner_key: str
+    root_session_id: str
+    owner_epoch: int
+    engine_session_ids: set[str] = field(default_factory=set)
+    terminal_engine_session_ids: set[str] = field(default_factory=set)
+    next_event_seq: int = 1
+    event_seq_by_id: dict[str, int] = field(default_factory=dict)
+    finalized: bool = False
 
 
 @dataclass(frozen=True)
@@ -324,28 +346,66 @@ async def _sglang_worker_urls(args: Namespace) -> list[str]:
     return []
 
 
-def _shard_index_for_session(session_id: str, shard_count: int) -> int:
-    return zlib.crc32(session_id.encode("utf-8")) % shard_count
+def _shard_index_for_owner_key(program_owner_key: str, shard_count: int) -> int:
+    return zlib.crc32(program_owner_key.encode("utf-8")) % shard_count
 
 
-def _session_id_from_request(*, request: Request) -> str:
+def _authentication_error(message: str = "Invalid authentication credential") -> AgenticChatRequestError:
+    return AgenticChatRequestError(
+        message,
+        code="authentication_error",
+        status_code=401,
+        error_type="authentication_error",
+    )
+
+
+def _credential_for_nonce(*, shard_index: int, owner_epoch: int, credential_nonce: str) -> str:
+    if (
+        not isinstance(credential_nonce, str)
+        or len(credential_nonce) != _AGENTIC_CREDENTIAL_NONCE_HEX_LENGTH
+        or any(char not in "0123456789abcdef" for char in credential_nonce)
+    ):
+        raise ValueError("credential_nonce must be a 256-bit lowercase hexadecimal value")
+    if not isinstance(owner_epoch, int) or isinstance(owner_epoch, bool) or owner_epoch <= 0:
+        raise ValueError("owner_epoch must be a positive integer")
+    return f"{_AGENTIC_CREDENTIAL_VERSION}.{int(shard_index)}.{owner_epoch}.{credential_nonce}"
+
+
+def _credential_route_from_request(*, request: Request, shard_count: int) -> tuple[int, int, str]:
     header = request.headers.get("Authorization")
     if not header:
-        raise AgenticChatRequestError(
+        raise _authentication_error(
             "Missing Authorization header",
-            code="authentication_error",
-            status_code=401,
-            error_type="authentication_error",
         )
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise AgenticChatRequestError(
+        raise _authentication_error(
             "Authorization header must be 'Bearer <token>'",
-            code="authentication_error",
-            status_code=401,
-            error_type="authentication_error",
         )
-    return token
+    parts = token.split(".")
+    version, shard_text, owner_epoch_text, nonce = parts if len(parts) == 4 else ("", "", "", "")
+    if (
+        version != _AGENTIC_CREDENTIAL_VERSION
+        or not shard_text.isdigit()
+        or not owner_epoch_text.isdigit()
+        or len(shard_text) > _AGENTIC_CREDENTIAL_SHARD_DIGITS_MAX
+        or len(owner_epoch_text) > _AGENTIC_CREDENTIAL_EPOCH_DIGITS_MAX
+        or (len(shard_text) > 1 and shard_text.startswith("0"))
+        or (len(owner_epoch_text) > 1 and owner_epoch_text.startswith("0"))
+        or len(nonce) != _AGENTIC_CREDENTIAL_NONCE_HEX_LENGTH
+        or any(char not in "0123456789abcdef" for char in nonce)
+    ):
+        raise _authentication_error()
+    try:
+        shard_index = int(shard_text)
+        owner_epoch = int(owner_epoch_text)
+    except ValueError as exc:
+        raise _authentication_error() from exc
+    if shard_index < 0 or shard_index >= shard_count:
+        raise _authentication_error()
+    if owner_epoch <= 0:
+        raise _authentication_error()
+    return shard_index, owner_epoch, hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -665,6 +725,8 @@ class AgenticSessionShard:
         *,
         sglang_request_capacity: int | None = None,
         sglang_request_limiter: Any | None = None,
+        shard_index: int = 0,
+        shard_count: int = 1,
     ) -> None:
         if isinstance(config_payload, Namespace):
             self.args = config_payload
@@ -673,6 +735,14 @@ class AgenticSessionShard:
         init_http_client(self.args)
         resources = get_agentic_runtime_resources(self.args)
         self.backend = SGLangBackendAdapter(self.args, compiler_resources=resources.compiler)
+        self._shard_index = int(shard_index)
+        self._shard_count = int(shard_count)
+        self._owner_epoch = secrets.randbits(63) or 1
+        self._program_records: dict[str, _ProgramRecord] = {}
+        self._program_locks: dict[str, asyncio.Lock] = {}
+        self._registration_lock = asyncio.Lock()
+        self._terminal_program_owner_keys: deque[str] = deque()
+        self._credential_session_ids: dict[str, str] = {}
         self._session_records: dict[str, _SessionRecord] = {}
         self._session_locks: dict[str, Any] = {}
         self._evaluating = 0
@@ -691,6 +761,25 @@ class AgenticSessionShard:
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock | None:
         return self._session_locks.get(session_id)
+
+    def _ensure_program_lock(self, program_owner_key: str) -> asyncio.Lock:
+        lock = self._program_locks.get(program_owner_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._program_locks[program_owner_key] = lock
+        return lock
+
+    @staticmethod
+    def _record_program_event(*, program: _ProgramRecord, event_id: str) -> int:
+        # Program lifecycle methods run on the shard's default async actor loop.
+        # Keep this mutation await-free so event_seq allocation is atomic on that loop.
+        existing = program.event_seq_by_id.get(event_id)
+        if existing is not None:
+            return existing
+        event_seq = program.next_event_seq
+        program.next_event_seq += 1
+        program.event_seq_by_id[event_id] = event_seq
+        return event_seq
 
     @ray.method(concurrency_group="sglang_request_permit")
     async def acquire_sglang_request_permit(self) -> None:
@@ -951,7 +1040,9 @@ class AgenticSessionShard:
     async def _register_session(
         self,
         *,
-        session_id: str,
+        identity: AgenticIdentity,
+        credential_nonce: str,
+        event_id: str,
         scope_id: str,
         rollout_id: int,
         group_id: str | None = None,
@@ -959,53 +1050,127 @@ class AgenticSessionShard:
         gate_reason: str | None = None,
         sampling_params: dict[str, Any] | None = None,
         session_seed: dict[str, Any] | None = None,
-    ) -> bool:
+    ) -> dict[str, Any]:
         if not isinstance(scope_id, str) or not scope_id:
             raise RuntimeError("Agentic session registration requires a non-empty scope_id.")
-        async with self._ensure_session_lock(session_id):
-            record = self._session_records.get(session_id)
-            if record is None:
-                record = _SessionRecord(
-                    forest=None,
-                    rollout_id=rollout_id,
-                    scope_id=scope_id,
-                    session_sampling_params=copy.deepcopy(sampling_params)
-                    if sampling_params is not None
-                    else self._default_sampling_params(sample_index=None),
-                    session_seed=copy.deepcopy(session_seed) if isinstance(session_seed, dict) else {},
-                    group_id=str(group_id) if isinstance(group_id, str) and group_id else None,
-                    group_generation=group_generation,
+        if not isinstance(event_id, str) or not event_id:
+            raise RuntimeError("Agentic session registration requires a non-empty event_id.")
+        expected_shard_index = _shard_index_for_owner_key(identity.program_owner_key, self._shard_count)
+        if expected_shard_index != self._shard_index:
+            raise RuntimeError("Agentic session registration reached the wrong program owner shard.")
+        credential = _credential_for_nonce(
+            shard_index=self._shard_index,
+            owner_epoch=self._owner_epoch,
+            credential_nonce=credential_nonce,
+        )
+        credential_digest = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        session_id = identity.engine_session_id
+        existing_record = self._session_records.get(session_id)
+        if existing_record is not None and (
+            existing_record.identity != identity or existing_record.credential_digest != credential_digest
+        ):
+            raise RuntimeError("Agentic engine session registration conflicts with its existing identity.")
+        mapped_session_id = self._credential_session_ids.get(credential_digest)
+        if mapped_session_id is not None and mapped_session_id != session_id:
+            raise RuntimeError("Agentic credential is already registered to another engine session.")
+        async with self._ensure_program_lock(identity.program_owner_key):
+            program = self._program_records.get(identity.program_owner_key)
+            if program is None:
+                if identity.parent_engine_session_id is not None:
+                    raise RuntimeError("Cannot register a subagent before its parent engine session.")
+                program = _ProgramRecord(
+                    program_id=identity.program_id,
+                    program_owner_key=identity.program_owner_key,
+                    root_session_id=identity.root_session_id,
+                    owner_epoch=self._owner_epoch,
                 )
-                self._set_session_gate_locked(record=record, gate_reason=gate_reason)
-                self._session_records[session_id] = record
-            else:
-                if record.scope_id != scope_id:
-                    raise RuntimeError(
-                        f"Agentic session {session_id!r} is already registered in scope "
-                        f"{record.scope_id!r}, got {scope_id!r}."
+                self._program_records[identity.program_owner_key] = program
+                self._record_program_event(
+                    program=program,
+                    event_id=f"program_open:{identity.program_id}",
+                )
+            elif (
+                program.program_id != identity.program_id
+                or program.root_session_id != identity.root_session_id
+                or program.owner_epoch != self._owner_epoch
+            ):
+                raise RuntimeError("Agentic session registration conflicts with the existing program owner.")
+            if program.finalized:
+                raise RuntimeError("Cannot register an engine session into a finalized agentic program.")
+            if session_id in program.terminal_engine_session_ids:
+                raise RuntimeError("Cannot reopen a terminated agentic engine session.")
+            if identity.parent_engine_session_id is not None:
+                parent = self._session_records.get(identity.parent_engine_session_id)
+                if (
+                    parent is None
+                    or parent.identity is None
+                    or parent.identity.program_id != identity.program_id
+                    or parent.identity.program_owner_key != identity.program_owner_key
+                    or parent.identity.root_session_id != identity.root_session_id
+                ):
+                    raise RuntimeError("Agentic subagent parent does not belong to the same program.")
+            async with self._ensure_session_lock(session_id):
+                record = self._session_records.get(session_id)
+                if record is None:
+                    record = _SessionRecord(
+                        forest=None,
+                        rollout_id=rollout_id,
+                        scope_id=scope_id,
+                        session_sampling_params=copy.deepcopy(sampling_params)
+                        if sampling_params is not None
+                        else self._default_sampling_params(sample_index=None),
+                        session_seed=copy.deepcopy(session_seed) if isinstance(session_seed, dict) else {},
+                        group_id=str(group_id) if isinstance(group_id, str) and group_id else None,
+                        group_generation=group_generation,
+                        identity=identity,
+                        credential_digest=credential_digest,
                     )
-                record.rollout_id = rollout_id
-                if sampling_params is not None:
-                    record.session_sampling_params = copy.deepcopy(sampling_params)
-                if isinstance(session_seed, dict) and session_seed:
-                    record.session_seed = copy.deepcopy(session_seed)
-                if isinstance(group_id, str) and group_id:
-                    record.group_id = str(group_id)
-                record.group_generation = group_generation
-                if isinstance(gate_reason, str):
                     self._set_session_gate_locked(record=record, gate_reason=gate_reason)
-        return True
+                    self._session_records[session_id] = record
+                else:
+                    if record.identity != identity or record.credential_digest != credential_digest:
+                        raise RuntimeError("Agentic engine session registration conflicts with its existing identity.")
+                    if record.scope_id != scope_id:
+                        raise RuntimeError(
+                            f"Agentic session {session_id!r} is already registered in scope "
+                            f"{record.scope_id!r}, got {scope_id!r}."
+                        )
+                    record.rollout_id = rollout_id
+                    if sampling_params is not None:
+                        record.session_sampling_params = copy.deepcopy(sampling_params)
+                    if isinstance(session_seed, dict) and session_seed:
+                        record.session_seed = copy.deepcopy(session_seed)
+                    if isinstance(group_id, str) and group_id:
+                        record.group_id = str(group_id)
+                    record.group_generation = group_generation
+                    if isinstance(gate_reason, str):
+                        self._set_session_gate_locked(record=record, gate_reason=gate_reason)
+                self._credential_session_ids[credential_digest] = session_id
+                program.engine_session_ids.add(session_id)
+                event_seq = self._record_program_event(program=program, event_id=event_id)
+        return {
+            "program_owner_key": identity.program_owner_key,
+            "engine_session_id": session_id,
+            "owner_epoch": program.owner_epoch,
+            "credential": credential,
+            "event_seq": event_seq,
+        }
 
-    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> int:
+    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_entries = []
         for entry in entries:
             session_id = entry["session_id"]
+            identity = AgenticIdentity.from_payload(entry["identity"])
+            if identity.engine_session_id != session_id:
+                raise RuntimeError("Agentic session registration identity does not match session_id.")
             scope_id = entry["scope_id"]
             if not isinstance(scope_id, str) or not scope_id:
                 raise RuntimeError("Agentic session batch registration requires a non-empty scope_id.")
             normalized_entries.append(
                 dict(
-                    session_id=session_id,
+                    identity=identity,
+                    credential_nonce=entry["credential_nonce"],
+                    event_id=entry["event_id"],
                     scope_id=scope_id,
                     rollout_id=entry["rollout_id"],
                     group_id=entry["group_id"],
@@ -1016,23 +1181,43 @@ class AgenticSessionShard:
                 )
             )
         if not normalized_entries:
-            return 0
-        await asyncio.gather(
-            *(
-                self._register_session(
-                    session_id=entry["session_id"],
-                    scope_id=entry["scope_id"],
-                    rollout_id=entry["rollout_id"],
-                    group_id=entry["group_id"],
-                    group_generation=entry["group_generation"],
-                    gate_reason=entry["gate_reason"],
-                    sampling_params=entry["sampling_params"],
-                    session_seed=entry["session_seed"],
+            return []
+        grants: list[dict[str, Any]] = []
+        async with self._registration_lock:
+            credential_claims: dict[str, str] = {}
+            session_claims: dict[str, AgenticIdentity] = {}
+            for entry in normalized_entries:
+                identity = entry["identity"]
+                credential = _credential_for_nonce(
+                    shard_index=self._shard_index,
+                    owner_epoch=self._owner_epoch,
+                    credential_nonce=entry["credential_nonce"],
                 )
-                for entry in normalized_entries
-            )
-        )
-        return len(normalized_entries)
+                credential_digest = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+                claimed_session_id = credential_claims.get(credential_digest)
+                if claimed_session_id is not None and claimed_session_id != identity.engine_session_id:
+                    raise RuntimeError("Agentic credential is claimed by multiple engine sessions in one batch.")
+                credential_claims[credential_digest] = identity.engine_session_id
+                claimed_identity = session_claims.get(identity.engine_session_id)
+                if claimed_identity is not None and claimed_identity != identity:
+                    raise RuntimeError("Agentic engine session has conflicting identities in one batch.")
+                session_claims[identity.engine_session_id] = identity
+            for entry in normalized_entries:
+                grants.append(
+                    await self._register_session(
+                        identity=entry["identity"],
+                        credential_nonce=entry["credential_nonce"],
+                        event_id=entry["event_id"],
+                        scope_id=entry["scope_id"],
+                        rollout_id=entry["rollout_id"],
+                        group_id=entry["group_id"],
+                        group_generation=entry["group_generation"],
+                        gate_reason=entry["gate_reason"],
+                        sampling_params=entry["sampling_params"],
+                        session_seed=entry["session_seed"],
+                    )
+                )
+        return grants
 
     async def mark_chat_service_response_ready(
         self,
@@ -2074,6 +2259,72 @@ class AgenticSessionShard:
             artifact_ref=artifact_ref,
         )
 
+    def _authenticated_session_id(self, *, credential_digest: str, owner_epoch: int) -> str | None:
+        if owner_epoch != self._owner_epoch:
+            return None
+        session_id = self._credential_session_ids.get(credential_digest)
+        if session_id is None or session_id not in self._session_records:
+            return None
+        return session_id
+
+    async def chat_authenticated(
+        self,
+        *,
+        credential_digest: str,
+        owner_epoch: int,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        temperature: float | None,
+        top_p: float | None,
+        max_completion_tokens: int | None,
+        stop: list[str] | str | None,
+        seed: int | None,
+        logprobs: bool = False,
+    ) -> dict[str, Any]:
+        session_id = self._authenticated_session_id(
+            credential_digest=credential_digest,
+            owner_epoch=owner_epoch,
+        )
+        if session_id is None:
+            return _openai_error_from_exc(_authentication_error())
+        return await self.chat(
+            session_id=session_id,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            stop=stop,
+            seed=seed,
+            logprobs=logprobs,
+        )
+
+    async def mark_chat_service_response_ready_authenticated(
+        self,
+        *,
+        credential_digest: str,
+        owner_epoch: int,
+        request_id: str,
+        remote_return_at: float | None,
+        response_ready_at: float | None,
+        http_return_at: float | None,
+    ) -> bool:
+        session_id = self._authenticated_session_id(
+            credential_digest=credential_digest,
+            owner_epoch=owner_epoch,
+        )
+        if session_id is None:
+            return False
+        return await self.mark_chat_service_response_ready(
+            session_id=session_id,
+            request_id=request_id,
+            remote_return_at=remote_return_at,
+            response_ready_at=response_ready_at,
+            http_return_at=http_return_at,
+        )
+
     async def chat(
         self,
         *,
@@ -2145,6 +2396,14 @@ class AgenticSessionShard:
                     bootstrap_compiler_timing=bootstrap_compiler_timing,
                     observation_compiler_timing=observation_compiler_timing,
                 )
+                identity = getattr(record, "identity", None)
+                if identity is not None:
+                    program = self._program_records.get(identity.program_owner_key)
+                    if program is not None:
+                        self._record_program_event(
+                            program=program,
+                            event_id=f"request_ready:{ir.request_id}",
+                        )
                 waiter = asyncio.get_running_loop().create_future()
                 record.pending_chat_waiters[ir.request_id] = waiter
                 if ir.sampling_params.get("max_new_tokens", 1) == 0:
@@ -2277,59 +2536,110 @@ class AgenticSessionShard:
         waiters: list[asyncio.Future[Any]] = []
         backend_request_ids: list[str] = []
         if removed is not None:
+            credential_digest = getattr(removed, "credential_digest", None)
+            credential_session_ids = getattr(self, "_credential_session_ids", None)
+            if isinstance(credential_digest, str) and isinstance(credential_session_ids, dict):
+                credential_session_ids.pop(credential_digest, None)
             active_tasks = list(removed.active_ir_runner_tasks.values())
             waiters = list(removed.pending_chat_waiters.values())
             backend_request_ids = [ir.request_id for ir in removed.irs_by_id.values() if ir.backend_started]
             self._clear_removed_record_state(removed)
         return removed, stats, active_tasks, waiters, backend_request_ids
 
+    def _program_for_control_ref(self, *, control_ref: SessionControlRef) -> _ProgramRecord | None:
+        program = self._program_records.get(control_ref.program_owner_key)
+        if program is None or program.owner_epoch != control_ref.owner_epoch:
+            return None
+        record = self._session_records.get(control_ref.engine_session_id)
+        if record is None or record.identity is None:
+            return None
+        if record.identity.program_owner_key != control_ref.program_owner_key:
+            return None
+        return program
+
+    def _mark_engine_session_terminal_locked(
+        self,
+        *,
+        program: _ProgramRecord,
+        session_id: str,
+        event_id: str,
+    ) -> int:
+        event_seq = self._record_program_event(program=program, event_id=event_id)
+        program.terminal_engine_session_ids.add(session_id)
+        if not program.finalized and program.terminal_engine_session_ids >= program.engine_session_ids:
+            self._record_program_event(
+                program=program,
+                event_id=f"program_finalize:{program.program_id}",
+            )
+            program.finalized = True
+            self._terminal_program_owner_keys.append(program.program_owner_key)
+            while len(self._terminal_program_owner_keys) > _TERMINATED_PROGRAM_TOMBSTONE_LIMIT:
+                expired_owner_key = self._terminal_program_owner_keys.popleft()
+                expired = self._program_records.get(expired_owner_key)
+                if expired is not None and expired.finalized:
+                    self._program_records.pop(expired_owner_key, None)
+        return event_seq
+
     async def finalize_and_discard(
         self,
         *,
-        session_id: str,
+        control_ref: SessionControlRef,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
     ) -> FinalizedResultTransport:
+        session_id = control_ref.engine_session_id
         finalize_arrive_at = time.time()
-        lock = self._get_session_lock(session_id)
-        if lock is None:
-            return FinalizedResultTransport(
-                status="discarded",
-                metadata={"discard_reason": "already_discarded"},
-            )
-        active_tasks: list[asyncio.Task[Any]] = []
-        waiters: list[asyncio.Future[Any]] = []
-        removed = None
-        stats = None
-        transport = None
-        async with lock:
-            finalize_lock_acquired_at = time.time()
-            record = self._session_records.get(session_id)
-            if record is None:
+        async with self._ensure_program_lock(control_ref.program_owner_key):
+            program = self._program_for_control_ref(control_ref=control_ref)
+            if program is None:
+                return FinalizedResultTransport(
+                    status="discarded",
+                    metadata={"discard_reason": "stale_or_discarded_owner"},
+                )
+            lock = self._get_session_lock(session_id)
+            if lock is None:
                 return FinalizedResultTransport(
                     status="discarded",
                     metadata={"discard_reason": "already_discarded"},
                 )
-            leaf_node = self._exportable_leaf_node(record)
-            if leaf_node is None:
-                transport = FinalizedResultTransport(
-                    status="non_finalizable",
-                    metadata={"discard_reason": "no_committed_response"},
+            active_tasks: list[asyncio.Task[Any]] = []
+            waiters: list[asyncio.Future[Any]] = []
+            removed = None
+            stats = None
+            transport = None
+            async with lock:
+                finalize_lock_acquired_at = time.time()
+                record = self._session_records.get(session_id)
+                if record is None:
+                    return FinalizedResultTransport(
+                        status="discarded",
+                        metadata={"discard_reason": "already_discarded"},
+                    )
+                leaf_node = self._exportable_leaf_node(record)
+                if leaf_node is None:
+                    transport = FinalizedResultTransport(
+                        status="non_finalizable",
+                        metadata={"discard_reason": "no_committed_response"},
+                    )
+                else:
+                    profile = agentic_trace_events(leaf_node.export_metadata_patch)
+                    mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
+                    mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
+                    sample = self._finalize_sample_from_leaf(
+                        record=record,
+                        leaf_node=leaf_node,
+                        reward=reward,
+                        metadata=metadata,
+                    )
+                    transport = self._build_transport_from_sample(sample)
+                removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
+                    session_id=session_id
                 )
-            else:
-                profile = agentic_trace_events(leaf_node.export_metadata_patch)
-                mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
-                mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
-                sample = self._finalize_sample_from_leaf(
-                    record=record,
-                    leaf_node=leaf_node,
-                    reward=reward,
-                    metadata=metadata,
+                self._mark_engine_session_terminal_locked(
+                    program=program,
+                    session_id=session_id,
+                    event_id=f"engine_session_finalize:{session_id}",
                 )
-                transport = self._build_transport_from_sample(sample)
-            removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                session_id=session_id
-            )
         await self._finish_discarded_session(
             session_id=session_id,
             lock=lock,
@@ -2341,18 +2651,28 @@ class AgenticSessionShard:
         )
         return transport
 
-    async def discard_session(self, *, session_id: str) -> bool:
-        lock = self._get_session_lock(session_id)
-        if lock is None:
-            return False
-        active_tasks: list[asyncio.Task[Any]] = []
-        waiters: list[asyncio.Future[Any]] = []
-        removed = None
-        stats = None
-        async with lock:
-            removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                session_id=session_id
-            )
+    async def discard_session(self, *, control_ref: SessionControlRef) -> bool:
+        session_id = control_ref.engine_session_id
+        async with self._ensure_program_lock(control_ref.program_owner_key):
+            program = self._program_for_control_ref(control_ref=control_ref)
+            if program is None:
+                return False
+            lock = self._get_session_lock(session_id)
+            if lock is None:
+                return False
+            active_tasks: list[asyncio.Task[Any]] = []
+            waiters: list[asyncio.Future[Any]] = []
+            removed = None
+            stats = None
+            async with lock:
+                removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
+                    session_id=session_id
+                )
+                self._mark_engine_session_terminal_locked(
+                    program=program,
+                    session_id=session_id,
+                    event_id=f"engine_session_discard:{session_id}",
+                )
         return await self._finish_discarded_session(
             session_id=session_id,
             lock=lock,
@@ -2387,6 +2707,8 @@ def create_agentic_session_shards(config: Namespace):
                 config,
                 sglang_request_capacity=request_capacity if idx == 0 else None,
                 sglang_request_limiter=shard_handles[0] if idx > 0 else None,
+                shard_index=idx,
+                shard_count=shard_count,
             )
         )
     return shard_handles
@@ -2402,8 +2724,8 @@ class AgenticChatAPIService:
             raise RuntimeError("Agentic chat API requires at least one session shard")
         init_http_client(self.args)
 
-    def _shard_handle(self, session_id: str):
-        shard_idx = _shard_index_for_session(session_id, len(self._shard_handles))
+    def _shard_handle_for_owner_key(self, program_owner_key: str):
+        shard_idx = _shard_index_for_owner_key(program_owner_key, len(self._shard_handles))
         return self._shard_handles[shard_idx]
 
     @app.get("/healthz")
@@ -2465,18 +2787,21 @@ class AgenticChatAPIService:
             session_ids.extend(str(session_id) for session_id in batch)
         return session_ids
 
-    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> int:
-        grouped: dict[Any, list[dict[str, Any]]] = {}
+    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[int, list[dict[str, Any]]] = {}
         for entry in entries:
-            session_id = entry["session_id"]
-            handle = self._shard_handle(session_id)
-            grouped.setdefault(handle, []).append(entry)
+            identity = AgenticIdentity.from_payload(entry["identity"])
+            shard_index = _shard_index_for_owner_key(identity.program_owner_key, len(self._shard_handles))
+            grouped.setdefault(shard_index, []).append(entry)
         if not grouped:
-            return 0
-        counts = await asyncio.gather(
-            *(handle.register_sessions_batch.remote(entries=batch) for handle, batch in grouped.items())
+            return []
+        batches = await asyncio.gather(
+            *(
+                self._shard_handles[shard_index].register_sessions_batch.remote(entries=batch)
+                for shard_index, batch in grouped.items()
+            )
         )
-        return sum(int(count or 0) for count in counts)
+        return [grant for batch in batches for grant in batch]
 
     async def prepare_group_status(self, *, scope_id: str) -> list[dict[str, Any]]:
         snapshots = await asyncio.gather(
@@ -2532,18 +2857,20 @@ class AgenticChatAPIService:
     async def finalize_and_discard(
         self,
         *,
-        session_id: str,
+        control_ref: SessionControlRef,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
     ) -> FinalizedResultTransport:
-        return await self._shard_handle(session_id).finalize_and_discard.remote(
-            session_id=session_id,
+        return await self._shard_handle_for_owner_key(control_ref.program_owner_key).finalize_and_discard.remote(
+            control_ref=control_ref,
             metadata=metadata,
             reward=reward,
         )
 
-    async def discard_session(self, *, session_id: str) -> bool:
-        return await self._shard_handle(session_id).discard_session.remote(session_id=session_id)
+    async def discard_session(self, *, control_ref: SessionControlRef) -> bool:
+        return await self._shard_handle_for_owner_key(control_ref.program_owner_key).discard_session.remote(
+            control_ref=control_ref
+        )
 
     async def release_partial_resume_gate(self, *, rollout_id: int) -> int:
         counts = await asyncio.gather(
@@ -2674,14 +3001,19 @@ class AgenticChatAPIService:
             if not isinstance(payload, dict):
                 raise AgenticChatRequestError("request body must be a JSON object", param="body")
             request_payload = _normalized_chat_request(payload)
-            session_id = _session_id_from_request(request=request)
+            shard_index, owner_epoch, credential_digest = _credential_route_from_request(
+                request=request,
+                shard_count=len(self._shard_handles),
+            )
         except AgenticChatRequestError as exc:
             return _openai_error_response(_openai_error_from_exc(exc))
         request_ready_at = time.time()
         shard_dispatch_at = time.time()
         try:
-            response = await self._shard_handle(session_id).chat.remote(
-                session_id=session_id,
+            shard_handle = self._shard_handles[shard_index]
+            response = await shard_handle.chat_authenticated.remote(
+                credential_digest=credential_digest,
+                owner_epoch=owner_epoch,
                 messages=request_payload["messages"],
                 tools=request_payload["tools"],
                 chat_template_kwargs=request_payload["chat_template_kwargs"],
@@ -2691,6 +3023,15 @@ class AgenticChatAPIService:
                 stop=request_payload["stop"],
                 seed=request_payload["seed"],
                 logprobs=request_payload["logprobs"],
+            )
+        except ray.exceptions.RayActorError:
+            return _openai_error_response(
+                _openai_error_result(
+                    "Agentic session owner is unavailable.",
+                    code="service_unavailable",
+                    status_code=503,
+                    error_type="service_unavailable",
+                )
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as exc:
             if isinstance(exc, ray.exceptions.RayTaskError) and not isinstance(
@@ -2722,8 +3063,9 @@ class AgenticChatAPIService:
         http_return_at = time.time()
         mark_agentic_event(service_profile, "chat_service_http_return_at", http_return_at)
         try:
-            await self._shard_handle(session_id).mark_chat_service_response_ready.remote(
-                session_id=session_id,
+            await shard_handle.mark_chat_service_response_ready_authenticated.remote(
+                credential_digest=credential_digest,
+                owner_epoch=owner_epoch,
                 request_id=response["request_id"],
                 remote_return_at=service_remote_return_at,
                 response_ready_at=response_ready_at,
@@ -2734,15 +3076,13 @@ class AgenticChatAPIService:
                 exc.as_instanceof_cause(), ray.exceptions.TaskCancelledError
             ):
                 logger.warning(
-                    "Failed to mark chat service response ready for session=%s request=%s: %s",
-                    session_id,
+                    "Failed to mark chat service response ready for request=%s: %s",
                     response["request_id"],
                     exc,
                 )
         except Exception as exc:
             logger.warning(
-                "Failed to mark chat service response ready for session=%s request=%s: %s",
-                session_id,
+                "Failed to mark chat service response ready for request=%s: %s",
                 response["request_id"],
                 exc,
             )
@@ -2753,7 +3093,7 @@ class AgenticChatAPIService:
             "finish_reason": response["finish_reason"],
         }
         response_payload = {
-            "id": f"chatcmpl_{session_id}_{int(time.time() * 1000)}",
+            "id": f"chatcmpl_{response['request_id']}_{int(time.time() * 1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
             "choices": [choice],

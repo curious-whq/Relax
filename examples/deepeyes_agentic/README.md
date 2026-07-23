@@ -42,18 +42,22 @@ RELAX_INPUT_JSON
 RELAX_OUTPUT_JSON
 RELAX_BASE_URL
 RELAX_SESSION_ID
+RELAX_API_KEY
 ```
 
 `run_agent_app.sh` maps them to:
 
 ```bash
 export OPENAI_BASE_URL="${RELAX_BASE_URL}"
-export OPENAI_API_KEY="${RELAX_SESSION_ID}"
+export OPENAI_API_KEY="${RELAX_API_KEY:-${RELAX_SESSION_ID}}"
 
 python -m app.agent \
     --input-json "${RELAX_INPUT_JSON}" \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
+
+The `RELAX_SESSION_ID` fallback is only for older Relax runtimes. The current managed runtime authenticates with
+`RELAX_API_KEY`.
 
 ## Data flow
 

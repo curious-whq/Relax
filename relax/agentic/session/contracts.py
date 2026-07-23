@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -58,6 +58,50 @@ class AgenticIdentity:
             self.parent_engine_session_id,
             field_name="parent_engine_session_id",
         )
+
+    def to_payload(self) -> dict[str, str | None]:
+        return {
+            "program_id": self.program_id,
+            "program_owner_key": self.program_owner_key,
+            "root_session_id": self.root_session_id,
+            "engine_session_id": self.engine_session_id,
+            "parent_engine_session_id": self.parent_engine_session_id,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "AgenticIdentity":
+        return cls(
+            program_id=payload["program_id"],
+            program_owner_key=payload["program_owner_key"],
+            root_session_id=payload["root_session_id"],
+            engine_session_id=payload["engine_session_id"],
+            parent_engine_session_id=payload.get("parent_engine_session_id"),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionControlRef:
+    program_owner_key: str
+    engine_session_id: str
+    owner_epoch: int
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.program_owner_key, field_name="program_owner_key")
+        _require_non_empty(self.engine_session_id, field_name="engine_session_id")
+        _require_non_negative_int(self.owner_epoch, field_name="owner_epoch")
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionRegistrationGrant:
+    control_ref: SessionControlRef
+    credential: str = field(repr=False)
+    event_seq: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.control_ref, SessionControlRef):
+            raise ValueError("control_ref must be a SessionControlRef")
+        _require_non_empty(self.credential, field_name="credential")
+        _require_non_negative_int(self.event_seq, field_name="event_seq")
 
 
 @dataclass(frozen=True, kw_only=True)

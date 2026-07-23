@@ -86,7 +86,8 @@ Relax 在 `--agent-cwd` 下运行 command，并注入这些环境变量：
 | `RELAX_OUTPUT_JSON` | `RELAX_SESSION_IO_DIR` 内可选的 output JSON file path。 |
 | `RELAX_SESSION_IO_DIR` | 每个 session 独立的临时 IO directory。 |
 | `RELAX_BASE_URL` | Relax OpenAI-compatible chat API 的 base URL。 |
-| `RELAX_SESSION_ID` | Session id，通常作为 OpenAI API key 使用。 |
+| `RELAX_SESSION_ID` | 内部 engine-session id，可安全用于 session 本地日志。 |
+| `RELAX_API_KEY` | 用于访问 managed Chat API 的不透明鉴权凭证。 |
 | `RELAX_ROLLOUT_MODE` | `train` 或 `eval`。 |
 | `RELAX_GROUP_ID` | 这个 session 所属的 runtime group id。 |
 
@@ -96,10 +97,13 @@ Relax 在 `--agent-cwd` 下运行 command，并注入这些环境变量：
 #!/usr/bin/env bash
 
 export OPENAI_BASE_URL="${RELAX_BASE_URL}"
-export OPENAI_API_KEY="${RELAX_SESSION_ID}"
+export OPENAI_API_KEY="${RELAX_API_KEY:-${RELAX_SESSION_ID}}"
 
 python -m my_agent --arg1 val1 --arg2 val2
 ```
+
+`RELAX_SESSION_ID` fallback 仅用于保持 launch script 与旧版 Relax runtime 兼容。当前 managed runtime 始终提供
+`RELAX_API_KEY`，当前 Chat API 不接受 session id 作为鉴权凭证。
 
 如果 agent 需要显式 session file path：
 
