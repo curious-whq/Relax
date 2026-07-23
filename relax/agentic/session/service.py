@@ -1495,6 +1495,8 @@ class AgenticSessionShard:
     def _maybe_start_next_ir_locked(self, *, session_id: str, record: _SessionRecord) -> bool:
         if not _decide_ir_release(record=record).allow:
             return False
+        if record.active_ir_runner_tasks:
+            return False
         started = False
         while True:
             ir = self._pop_next_ir_locked(record)
@@ -1522,7 +1524,7 @@ class AgenticSessionShard:
             record.active_ir_runner_tasks[ir.request_id] = asyncio.create_task(
                 self._run_ir(session_id=session_id, ir_id=ir.request_id, runner_epoch=runner_epoch)
             )
-            started = True
+            return True
         return started
 
     def _activate_record_locked(self, *, session_id: str, record: _SessionRecord, rollout_id: int) -> bool:
@@ -1765,6 +1767,7 @@ class AgenticSessionShard:
                     ),
                 )
                 self._release_ir_locked(record, ir_id)
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
             return
         except Exception as exc:
             if generation_profile is not None:
@@ -1788,6 +1791,7 @@ class AgenticSessionShard:
                     return
                 self._complete_waiter_locked(record, ir_id, exc=exc)
                 self._release_ir_locked(record, ir_id)
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
             return
         finally:
             if permit_acquired:

@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from relax.agentic.pipeline.runtime import (
+    BackendContextLengthExceededError,
     BackendGenerateResult,
     RuntimeGroup,
     _request_envelope_from_sample,
@@ -21,8 +22,9 @@ from relax.agentic.session.service import (
     _decide_ir_release,
     _normalized_chat_request,
     _openai_token_logprobs_payload,
+    _SessionRecord,
 )
-from relax.agentic.session.state import RequestKind, SessionForest, check_messages
+from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
 
 
@@ -409,6 +411,302 @@ def test_ir_gate_and_requeue_policy(
         expected_protected,
         expected_sibling_kind,
     )
+
+
+def _single_flight_ir(
+    request_id: str,
+    *,
+    max_new_tokens: int = 8,
+    kind: RequestKind = RequestKind.FRESH,
+) -> InflightRequest:
+    return InflightRequest(
+        request_id=request_id,
+        parent_state_hash="state-1",
+        rollout_id=1,
+        kind=kind,
+        abort_count=0,
+        sampling_params={"max_new_tokens": max_new_tokens},
+    )
+
+
+def _single_flight_record(*requests: InflightRequest) -> _SessionRecord:
+    record = _SessionRecord(scope_id="train", rollout_id=1)
+    for request in requests:
+        record.irs_by_id[request.request_id] = request
+        record.ir_queue.append(request.request_id)
+    return record
+
+
+def _single_flight_shard():
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard.args = SimpleNamespace(rollout_max_context_len=64)
+    shard._session_records = {}
+    shard._session_locks = {}
+    shard._sglang_request_semaphore = None
+    shard._sglang_request_limiter = None
+    return shard_cls, shard
+
+
+def test_session_scheduler_starts_one_ir_at_a_time_in_fifo_order(monkeypatch) -> None:
+    shard_cls, shard = _single_flight_shard()
+    requests = [_single_flight_ir(f"req-{index}") for index in range(3)]
+    record = _single_flight_record(*requests)
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    assert list(record.active_ir_runner_tasks) == ["req-0"]
+    assert list(record.ir_queue) == ["req-1", "req-2"]
+
+    assert not shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    assert list(record.active_ir_runner_tasks) == ["req-0"]
+
+    shard_cls._release_ir_locked(shard, record, "req-0")
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    assert list(record.active_ir_runner_tasks) == ["req-1"]
+    assert list(record.ir_queue) == ["req-2"]
+
+
+def test_session_scheduler_skips_zero_token_ir_before_starting_one_runner(monkeypatch) -> None:
+    shard_cls, shard = _single_flight_shard()
+    zero_token_ir = _single_flight_ir("req-zero", max_new_tokens=0)
+    runnable_ir = _single_flight_ir("req-runnable")
+    record = _single_flight_record(zero_token_ir, runnable_ir)
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    assert "req-zero" not in record.irs_by_id
+    assert list(record.active_ir_runner_tasks) == ["req-runnable"]
+
+
+def test_session_scheduler_allows_one_runner_per_sibling_session(monkeypatch) -> None:
+    shard_cls, shard = _single_flight_shard()
+    main_record = _single_flight_record(_single_flight_ir("req-main-0"), _single_flight_ir("req-main-1"))
+    sibling_record = _single_flight_record(
+        _single_flight_ir("req-sibling-0"),
+        _single_flight_ir("req-sibling-1"),
+    )
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="main", record=main_record)
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="sibling", record=sibling_record)
+    assert list(main_record.active_ir_runner_tasks) == ["req-main-0"]
+    assert list(sibling_record.active_ir_runner_tasks) == ["req-sibling-0"]
+
+
+def test_session_chat_requests_do_not_overlap_backend_generation() -> None:
+    shard_cls, shard, record, _initial_obs = _make_chat_test_shard()
+    first_backend_started = asyncio.Event()
+    release_first_backend = asyncio.Event()
+    backend_calls = []
+    backend_active = 0
+    max_backend_active = 0
+
+    async def _generate(**kwargs):
+        nonlocal backend_active, max_backend_active
+        backend_calls.append(kwargs["request_id"])
+        backend_active += 1
+        max_backend_active = max(max_backend_active, backend_active)
+        try:
+            if len(backend_calls) == 1:
+                first_backend_started.set()
+                await release_first_backend.wait()
+            return BackendGenerateResult(
+                new_tokens=_chars("ok"),
+                new_log_probs=[-0.1, -0.2],
+                finish_type="stop",
+                meta_info={},
+                elapsed=0.1,
+            )
+        finally:
+            backend_active -= 1
+
+    shard.backend.generate = _generate
+
+    async def _chat():
+        return await shard_cls.chat(
+            shard,
+            session_id="sess-chat",
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            tools=[],
+            chat_template_kwargs=None,
+            temperature=None,
+            top_p=None,
+            max_completion_tokens=None,
+            stop=None,
+            seed=None,
+        )
+
+    async def _run():
+        first_chat = asyncio.create_task(_chat())
+        await asyncio.wait_for(first_backend_started.wait(), timeout=1)
+        second_chat = asyncio.create_task(_chat())
+        for _ in range(20):
+            if record.ir_queue:
+                break
+            await asyncio.sleep(0)
+        assert len(record.active_ir_runner_tasks) == 1
+        assert len(record.ir_queue) == 1
+        assert backend_calls == ["req_sess-chat_0"]
+        release_first_backend.set()
+        return await asyncio.gather(first_chat, second_chat)
+
+    payloads = asyncio.run(_run())
+    assert [payload["message"]["content"] for payload in payloads] == ["ok", "ok"]
+    assert backend_calls == ["req_sess-chat_0", "req_sess-chat_1"]
+    assert max_backend_active == 1
+
+
+@pytest.mark.parametrize("backend_error", [BackendContextLengthExceededError("too long"), RuntimeError("failed")])
+@pytest.mark.asyncio
+async def test_session_runner_starts_next_ir_after_backend_error(backend_error: Exception) -> None:
+    shard_cls, shard = _single_flight_shard()
+    first = _single_flight_ir("req-0")
+    first.runner_epoch = 1
+    second = _single_flight_ir("req-1")
+    record = _single_flight_record(second)
+    record.irs_by_id[first.request_id] = first
+    record.active_ir_runner_tasks[first.request_id] = asyncio.current_task()
+    shard._session_records = {"session-1": record}
+    shard._session_locks = {"session-1": asyncio.Lock()}
+    backend_calls = []
+    backend_active = 0
+    max_backend_active = 0
+
+    async def _generate(**kwargs):
+        nonlocal backend_active, max_backend_active
+        backend_calls.append(kwargs["request_id"])
+        backend_active += 1
+        max_backend_active = max(max_backend_active, backend_active)
+        try:
+            raise type(backend_error)(str(backend_error))
+        finally:
+            backend_active -= 1
+
+    shard.backend = SimpleNamespace(generate=_generate)
+
+    await shard_cls._run_ir(shard, session_id="session-1", ir_id=first.request_id, runner_epoch=1)
+    for _ in range(20):
+        if not record.active_ir_runner_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert backend_calls == ["req-0", "req-1"]
+    assert max_backend_active == 1
+    assert record.irs_by_id == {}
+    assert record.ir_queue == deque()
+    assert record.active_ir_runner_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_session_runner_ignores_stale_runner_epoch() -> None:
+    shard_cls, shard = _single_flight_shard()
+    request = _single_flight_ir("req-0")
+    request.runner_epoch = 2
+    record = _single_flight_record()
+    record.irs_by_id[request.request_id] = request
+    record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
+    shard._session_records = {"session-1": record}
+    shard._session_locks = {"session-1": asyncio.Lock()}
+
+    async def _generate(**kwargs):
+        raise AssertionError(f"stale runner reached backend: {kwargs}")
+
+    shard.backend = SimpleNamespace(generate=_generate)
+
+    await shard_cls._run_ir(shard, session_id="session-1", ir_id=request.request_id, runner_epoch=1)
+    assert request.backend_started is False
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_session_abort_requeue_respects_gate_and_single_flight(monkeypatch, protected: bool) -> None:
+    shard_cls, shard, record, _initial_obs = _make_chat_test_shard()
+    kind = RequestKind.PROTECTED if protected else RequestKind.FRESH
+    active_ir = _single_flight_ir("req-active", kind=kind)
+    sibling_ir = _single_flight_ir("req-sibling", kind=kind)
+    record.protected_until_finalize = protected
+    record.irs_by_id = {
+        active_ir.request_id: active_ir,
+        sibling_ir.request_id: sibling_ir,
+    }
+    record.active_ir_runner_tasks = {active_ir.request_id: SimpleNamespace()}
+    record.ir_queue = deque([sibling_ir.request_id])
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+
+    shard_cls._requeue_aborted_ir_locked(
+        shard,
+        record=record,
+        ir_id=active_ir.request_id,
+        ir=active_ir,
+    )
+    shard_cls._maybe_start_next_ir_locked(shard, session_id="sess-chat", record=record)
+
+    assert len(record.active_ir_runner_tasks) <= 1
+    if protected:
+        assert list(record.active_ir_runner_tasks) == ["req-sibling"]
+    else:
+        assert record.active_ir_runner_tasks == {}
+        assert record.gate_reason == "partial_resume"
+
+
+def test_session_gate_blocks_queue_until_release(monkeypatch) -> None:
+    shard_cls, shard = _single_flight_shard()
+    record = _single_flight_record(_single_flight_ir("req-0"), _single_flight_ir("req-1"))
+    record.gate_reason = "prepare"
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+
+    assert not shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    record.gate_reason = None
+    assert shard_cls._maybe_start_next_ir_locked(shard, session_id="session-1", record=record)
+    assert list(record.active_ir_runner_tasks) == ["req-0"]
+    assert list(record.ir_queue) == ["req-1"]
+
+
+def test_session_discard_does_not_start_queued_ir() -> None:
+    shard_cls, shard = _single_flight_shard()
+    active_ir = _single_flight_ir("req-active")
+    queued_ir = _single_flight_ir("req-queued")
+    record = _single_flight_record(queued_ir)
+    active_task = SimpleNamespace()
+    record.irs_by_id[active_ir.request_id] = active_ir
+    record.active_ir_runner_tasks[active_ir.request_id] = active_task
+    shard._session_records = {"session-1": record}
+
+    removed, _stats, active_tasks, _waiters, backend_request_ids = shard_cls._discard_session_locked(
+        shard,
+        session_id="session-1",
+    )
+
+    assert removed is record
+    assert active_tasks == [active_task]
+    assert backend_request_ids == []
+    assert record.ir_queue == deque()
+    assert record.active_ir_runner_tasks == {}
 
 
 def test_admission_quota_prepare_isolation_and_resident_tail_carry() -> None:
