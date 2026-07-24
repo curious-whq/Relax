@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -21,6 +22,21 @@ class AdmissionReason(str, Enum):
     CAPACITY_EXHAUSTED = "capacity_exhausted"
     PRESSURE_GUARD = "pressure_guard"
     FAIRNESS_RESERVE = "fairness_reserve"
+
+
+class BudgetAcquireStatus(str, Enum):
+    ACQUIRED = "acquired"
+    CAPACITY_EXHAUSTED = "capacity_exhausted"
+    BYPASS = "bypass"
+    UNKNOWN = "unknown"
+
+
+class LeaseReleaseOutcome(str, Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    REQUEUED = "requeued"
+    STALE = "stale"
 
 
 def _require_non_empty(value: str, *, field_name: str) -> None:
@@ -123,6 +139,77 @@ class AdmissionDecision:
 
 
 @dataclass(frozen=True, kw_only=True)
+class AdmissionLease:
+    owner_epoch: int
+    dispatch_id: str
+    admission_decision_id: str
+    reservation_tokens: int
+    ttl_s: float
+    # This deadline is normalized by the shard-side budget port against the
+    # shard's local monotonic clock. Coordinator monotonic timestamps must not
+    # be compared across nodes.
+    expires_at_local_monotonic: float
+
+    def __post_init__(self) -> None:
+        _require_non_negative_int(self.owner_epoch, field_name="owner_epoch")
+        if self.owner_epoch == 0:
+            raise ValueError("owner_epoch must be positive for an admission lease")
+        _require_non_empty(self.dispatch_id, field_name="dispatch_id")
+        _require_non_empty(self.admission_decision_id, field_name="admission_decision_id")
+        _require_non_negative_int(self.reservation_tokens, field_name="reservation_tokens")
+        if (
+            not isinstance(self.ttl_s, (int, float))
+            or isinstance(self.ttl_s, bool)
+            or not math.isfinite(self.ttl_s)
+            or self.ttl_s <= 0
+        ):
+            raise ValueError("ttl_s must be positive")
+        if not isinstance(self.expires_at_local_monotonic, (int, float)) or isinstance(
+            self.expires_at_local_monotonic, bool
+        ):
+            raise ValueError("expires_at_local_monotonic must be a number")
+        if not math.isfinite(self.expires_at_local_monotonic) or self.expires_at_local_monotonic <= 0:
+            raise ValueError("expires_at_local_monotonic must be positive")
+
+
+@dataclass(frozen=True, kw_only=True)
+class BudgetAcquireResult:
+    status: BudgetAcquireStatus
+    reason_code: AdmissionReason
+    lease: AdmissionLease | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, BudgetAcquireStatus):
+            raise ValueError("status must be a BudgetAcquireStatus")
+        if not isinstance(self.reason_code, AdmissionReason):
+            raise ValueError("reason_code must be an AdmissionReason")
+        if self.status == BudgetAcquireStatus.ACQUIRED and self.lease is None:
+            raise ValueError("acquired budget result requires a lease")
+        if self.status != BudgetAcquireStatus.ACQUIRED and self.lease is not None:
+            raise ValueError("only an acquired budget result may carry a lease")
+
+
+@dataclass(frozen=True, kw_only=True)
+class AdmissionGrant:
+    decision: AdmissionDecision
+    lease: AdmissionLease | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, AdmissionDecision):
+            raise ValueError("decision must be an AdmissionDecision")
+        if self.decision.action == AdmissionAction.ADMIT and self.lease is None:
+            raise ValueError("admit grant requires a lease")
+        if self.decision.action != AdmissionAction.ADMIT and self.lease is not None:
+            raise ValueError("only an admit grant may carry a lease")
+        if self.lease is not None and (
+            self.lease.owner_epoch != self.decision.owner_epoch
+            or self.lease.admission_decision_id != self.decision.admission_decision_id
+            or self.lease.reservation_tokens != self.decision.reservation_tokens
+        ):
+            raise ValueError("admission lease does not match its decision")
+
+
+@dataclass(frozen=True, kw_only=True)
 class RoutingContext:
     request_id: str
     dispatch_id: str
@@ -164,6 +251,10 @@ class RoutingContext:
         if not isinstance(self.priority, int) or isinstance(self.priority, bool):
             raise ValueError("priority must be an integer")
         _require_optional_non_empty(self.affinity_key, field_name="affinity_key")
+
+    @property
+    def reservation_tokens(self) -> int:
+        return self.prompt_tokens + self.expected_decode_tokens
 
 
 @dataclass(frozen=True, kw_only=True)

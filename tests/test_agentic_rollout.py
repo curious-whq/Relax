@@ -562,13 +562,16 @@ def test_session_chat_requests_do_not_overlap_backend_generation() -> None:
             await asyncio.sleep(0)
         assert len(record.active_ir_runner_tasks) == 1
         assert len(record.ir_queue) == 1
-        assert backend_calls == ["req_sess-chat_0"]
+        assert len(backend_calls) == 1
+        assert backend_calls[0].startswith("dispatch-")
         release_first_backend.set()
         return await asyncio.gather(first_chat, second_chat)
 
     payloads = asyncio.run(_run())
     assert [payload["message"]["content"] for payload in payloads] == ["ok", "ok"]
-    assert backend_calls == ["req_sess-chat_0", "req_sess-chat_1"]
+    assert len(backend_calls) == 2
+    assert len(set(backend_calls)) == 2
+    assert all(request_id.startswith("dispatch-") for request_id in backend_calls)
     assert max_backend_active == 1
 
 
@@ -606,7 +609,9 @@ async def test_session_runner_starts_next_ir_after_backend_error(backend_error: 
             break
         await asyncio.sleep(0)
 
-    assert backend_calls == ["req-0", "req-1"]
+    assert len(backend_calls) == 2
+    assert len(set(backend_calls)) == 2
+    assert all(request_id.startswith("dispatch-") for request_id in backend_calls)
     assert max_backend_active == 1
     assert record.irs_by_id == {}
     assert record.ir_queue == deque()

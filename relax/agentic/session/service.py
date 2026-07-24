@@ -37,7 +37,17 @@ from relax.agentic.profile import (
     mark_agentic_event_once,
     mark_metadata_agentic_event,
 )
-from relax.agentic.session.contracts import AgenticIdentity, SessionControlRef
+from relax.agentic.session.admission import AdmissionTicket, ProgramScheduler
+from relax.agentic.session.contracts import (
+    AdmissionAction,
+    AdmissionDecision,
+    AdmissionGrant,
+    AdmissionReason,
+    AgenticIdentity,
+    LeaseReleaseOutcome,
+    RoutingContext,
+    SessionControlRef,
+)
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
@@ -130,6 +140,14 @@ _GATE_WAITING_REASONS = {
     _GATE_REASON_PARTIAL_RESUME: _WAITING_REASON_PARTIAL_RESUME_GATE,
     _GATE_REASON_TERMINAL_SHUTDOWN: _WAITING_REASON_TERMINAL_SHUTDOWN_GATE,
 }
+_ADMISSION_PRIORITY_BY_REQUEST_KIND = {
+    RequestKind.FRESH: 0,
+    RequestKind.RESUMED: 10,
+    RequestKind.PROTECTED: 100,
+}
+_ADMISSION_REVALIDATE_FAILURE_LIMIT = 3
+_ADMISSION_REVALIDATE_BACKOFF_S = 0.01
+_AGENTIC_RUNNER_CLEANUP_TIMEOUT_S = 1.0
 
 
 @dataclass
@@ -745,6 +763,8 @@ class AgenticSessionShard:
         self._credential_session_ids: dict[str, str] = {}
         self._session_records: dict[str, _SessionRecord] = {}
         self._session_locks: dict[str, Any] = {}
+        self._program_scheduler = ProgramScheduler()
+        self._permit_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._evaluating = 0
         self._terminal_ir_gate_closed = False
         self._sglang_request_semaphore = (
@@ -781,6 +801,13 @@ class AgenticSessionShard:
         program.event_seq_by_id[event_id] = event_seq
         return event_seq
 
+    def _scheduler(self) -> ProgramScheduler:
+        scheduler = getattr(self, "_program_scheduler", None)
+        if scheduler is None:
+            scheduler = ProgramScheduler()
+            self._program_scheduler = scheduler
+        return scheduler
+
     @ray.method(concurrency_group="sglang_request_permit")
     async def acquire_sglang_request_permit(self) -> None:
         if self._sglang_request_semaphore is None:
@@ -803,8 +830,16 @@ class AgenticSessionShard:
     @ray.method(concurrency_group="sglang_request_control")
     async def health(self) -> dict[str, Any]:
         queued_pending = 0
+        deferred_requests = 0
+        deferred_program_ids: set[str] = set()
         for record in self._session_records.values():
             queued_pending += len(record.ir_queue)
+            record_deferred = sum(
+                1 for ir in record.irs_by_id.values() if ir.admission_action == AdmissionAction.DEFER.value
+            )
+            deferred_requests += record_deferred
+            if record_deferred and record.identity is not None:
+                deferred_program_ids.add(record.identity.program_id)
         return {
             "ok": True,
             "active_sessions": len(self._session_records),
@@ -817,6 +852,11 @@ class AgenticSessionShard:
             ),
             "ir_queue": {
                 "queued": queued_pending,
+            },
+            "admission": {
+                "deferred_requests": deferred_requests,
+                "ready_programs": len(deferred_program_ids),
+                "permit_cleanup_pending": len(getattr(self, "_permit_cleanup_tasks", ())),
             },
         }
 
@@ -1478,6 +1518,9 @@ class AgenticSessionShard:
         if record.protected_until_finalize:
             ir.kind = RequestKind.PROTECTED
         ir.backend_started = False
+        ir.active_dispatch_id = None
+        ir.admission_decision_id = None
+        ir.admission_action = None
         record.ir_queue.append(ir.request_id)
 
     def _pop_next_ir_locked(self, record: _SessionRecord) -> InflightRequest | None:
@@ -1585,6 +1628,7 @@ class AgenticSessionShard:
             rollout_id=record.rollout_id,
             kind=RequestKind.PROTECTED if record.protected_until_finalize else request_kind,
             abort_count=parent_abort_count,
+            attempt_id=f"attempt-{secrets.token_hex(16)}",
             sampling_params=copy.deepcopy(sampling_params),
             logprobs=bool(logprobs),
             history_train_token_prefix=prefix.train_token_prefix,
@@ -1868,6 +1912,154 @@ class AgenticSessionShard:
         except Exception:
             logger.exception("Failed to release remote SGLang permit acquired after cancellation.")
 
+    async def _acquire_sglang_request_permit_for_ir(self) -> bool:
+        if self._sglang_request_semaphore is not None:
+            while True:
+                if self._sglang_request_semaphore.acquire(blocking=False):
+                    return True
+                await asyncio.sleep(0.01)
+        if self._sglang_request_limiter is None:
+            return False
+        acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote()
+        try:
+            await asyncio.shield(acquire_ref)
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                self._release_sglang_request_permit_after_cancel(
+                    limiter=self._sglang_request_limiter,
+                    acquire_ref=acquire_ref,
+                )
+            )
+            cleanup_tasks = getattr(self, "_permit_cleanup_tasks", None)
+            if cleanup_tasks is None:
+                cleanup_tasks = set()
+                self._permit_cleanup_tasks = cleanup_tasks
+            cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(cleanup_tasks.discard)
+            raise
+        return True
+
+    async def _release_sglang_request_permit_for_ir(self) -> None:
+        if self._sglang_request_semaphore is not None:
+            self._sglang_request_semaphore.release()
+        elif self._sglang_request_limiter is not None:
+            await self._sglang_request_limiter.release_sglang_request_permit.remote()
+
+    def _routing_context_locked(
+        self,
+        *,
+        record: _SessionRecord,
+        ir: InflightRequest,
+        dispatch_id: str,
+    ) -> RoutingContext | None:
+        identity = getattr(record, "identity", None)
+        if identity is None:
+            return None
+        program = getattr(self, "_program_records", {}).get(identity.program_owner_key)
+        if (
+            program is None
+            or program.finalized
+            or program.owner_epoch != self._owner_epoch
+            or program.program_id != identity.program_id
+        ):
+            return None
+        if not ir.attempt_id:
+            ir.attempt_id = f"attempt-{secrets.token_hex(16)}"
+        prompt_tokens = len(ir.history_rollout_token_prefix) + len(ir.pending_rollout_token_delta)
+        raw_expected_decode_tokens = ir.sampling_params.get("max_new_tokens", 0)
+        expected_decode_tokens = (
+            int(raw_expected_decode_tokens)
+            if isinstance(raw_expected_decode_tokens, int) and not isinstance(raw_expected_decode_tokens, bool)
+            else 0
+        )
+        expected_decode_tokens = max(0, expected_decode_tokens)
+        policy_decode_limit = getattr(self.args, "rollout_max_response_len", None)
+        if isinstance(policy_decode_limit, int) and not isinstance(policy_decode_limit, bool):
+            expected_decode_tokens = min(expected_decode_tokens, max(0, policy_decode_limit))
+        return RoutingContext(
+            request_id=ir.request_id,
+            dispatch_id=dispatch_id,
+            owner_epoch=program.owner_epoch,
+            program_id=identity.program_id,
+            root_session_id=identity.root_session_id,
+            engine_session_id=identity.engine_session_id,
+            parent_engine_session_id=identity.parent_engine_session_id,
+            attempt_id=ir.attempt_id,
+            context_version_id=ir.parent_state_hash,
+            serving_weight_version=None,
+            prompt_tokens=prompt_tokens,
+            expected_decode_tokens=expected_decode_tokens,
+            priority=_ADMISSION_PRIORITY_BY_REQUEST_KIND[ir.kind],
+            affinity_key=identity.engine_session_id,
+        )
+
+    def _record_admission_decision_locked(
+        self,
+        *,
+        record: _SessionRecord,
+        ir: InflightRequest,
+        decision: AdmissionDecision,
+    ) -> None:
+        previous_action = ir.admission_action
+        ir.admission_decision_id = decision.admission_decision_id
+        ir.admission_action = decision.action.value
+        profile = agentic_trace_events(ir.pending_export_metadata_patch)
+        profile["admission_action"] = decision.action.value
+        profile["admission_reason"] = decision.reason_code.value
+        profile["admission_reservation_tokens"] = decision.reservation_tokens
+        identity = getattr(record, "identity", None)
+        if identity is None:
+            return
+        program = getattr(self, "_program_records", {}).get(identity.program_owner_key)
+        if program is None or program.owner_epoch != decision.owner_epoch:
+            return
+        if decision.action == AdmissionAction.DEFER:
+            self._record_program_event(
+                program=program,
+                event_id=f"admission_deferred:{decision.admission_decision_id}",
+            )
+        elif previous_action == AdmissionAction.DEFER.value:
+            self._record_program_event(
+                program=program,
+                event_id=f"admission_resumed:{decision.admission_decision_id}",
+            )
+
+    def _record_dispatch_event_locked(
+        self,
+        *,
+        record: _SessionRecord,
+        event_name: str,
+        dispatch_id: str,
+    ) -> None:
+        identity = getattr(record, "identity", None)
+        if identity is None:
+            return
+        program = getattr(self, "_program_records", {}).get(identity.program_owner_key)
+        if program is None or program.finalized or program.owner_epoch != self._owner_epoch:
+            return
+        self._record_program_event(
+            program=program,
+            event_id=f"{event_name}:{dispatch_id}",
+        )
+
+    @staticmethod
+    def _active_ir_for_dispatch_locked(
+        *,
+        record: _SessionRecord,
+        ir_id: str,
+        runner_epoch: int,
+        dispatch_id: str,
+    ) -> InflightRequest | None:
+        ir = record.irs_by_id.get(ir_id)
+        if (
+            ir is None
+            or ir_id not in record.active_ir_runner_tasks
+            or ir.runner_epoch != runner_epoch
+            or ir.active_dispatch_id != dispatch_id
+        ):
+            return None
+        return ir
+
     async def _run_ir(self, *, session_id: str, ir_id: str, runner_epoch: int) -> None:
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -1886,55 +2078,200 @@ class AgenticSessionShard:
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(profile, "generation_queue_enter_at")
         permit_acquired = False
+        admission_grant: AdmissionGrant | None = None
+        admission_ticket: AdmissionTicket | None = None
+        lease_outcome = LeaseReleaseOutcome.CANCELLED
         generation_profile: dict[str, Any] | None = None
+        dispatch_id: str | None = None
+        revalidation_failures = 0
         try:
-            if self._sglang_request_semaphore is not None:
-                while True:
-                    if self._sglang_request_semaphore.acquire(blocking=False):
-                        permit_acquired = True
-                        break
-                    await asyncio.sleep(0.01)
-            elif self._sglang_request_limiter is not None:
-                acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote()
-                try:
-                    await asyncio.shield(acquire_ref)
-                except asyncio.CancelledError:
-                    asyncio.create_task(
-                        self._release_sglang_request_permit_after_cancel(
-                            limiter=self._sglang_request_limiter,
-                            acquire_ref=acquire_ref,
-                        )
+            while True:
+                lock = self._get_session_lock(session_id)
+                if lock is None:
+                    return
+                async with lock:
+                    record = self._session_records.get(session_id)
+                    if record is None:
+                        return
+                    ir = record.irs_by_id.get(ir_id)
+                    if ir is None or ir_id not in record.active_ir_runner_tasks or ir.runner_epoch != runner_epoch:
+                        return
+                    if self._should_requeue_active_ir_locked(record=record):
+                        self._gate_active_ir_release_locked(record=record, ir_id=ir_id, ir=ir)
+                        self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                        return
+                    dispatch_id = f"dispatch-{secrets.token_hex(16)}"
+                    ir.active_dispatch_id = dispatch_id
+                    routing_context = self._routing_context_locked(
+                        record=record,
+                        ir=ir,
+                        dispatch_id=dispatch_id,
                     )
-                    raise
-                permit_acquired = True
-            lock = self._get_session_lock(session_id)
-            if lock is None:
-                return
-            async with lock:
-                record = self._session_records.get(session_id)
-                if record is None:
+                    request_kind = ir.kind
+                ticket = await self._scheduler().submit(
+                    routing_context=routing_context,
+                    dispatch_id=dispatch_id,
+                    request_kind=request_kind,
+                    bypass_reason=(
+                        AdmissionReason.DEGRADED
+                        if revalidation_failures >= _ADMISSION_REVALIDATE_FAILURE_LIMIT
+                        else None
+                    ),
+                )
+                admission_ticket = ticket
+                lock = self._get_session_lock(session_id)
+                stale_ticket = lock is None
+                gated_ticket = False
+                if lock is not None:
+                    async with lock:
+                        record = self._session_records.get(session_id)
+                        active_ir = (
+                            None
+                            if record is None
+                            else self._active_ir_for_dispatch_locked(
+                                record=record,
+                                ir_id=ir_id,
+                                runner_epoch=runner_epoch,
+                                dispatch_id=dispatch_id,
+                            )
+                        )
+                        stale_ticket = active_ir is None
+                        if active_ir is not None:
+                            self._record_admission_decision_locked(
+                                record=record,
+                                ir=active_ir,
+                                decision=ticket.initial_decision,
+                            )
+                            if self._should_requeue_active_ir_locked(record=record):
+                                self._gate_active_ir_release_locked(
+                                    record=record,
+                                    ir_id=ir_id,
+                                    ir=active_ir,
+                                )
+                                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                                gated_ticket = True
+                if stale_ticket:
+                    await ticket.cancel(outcome=LeaseReleaseOutcome.STALE)
+                    admission_ticket = None
                     return
-                ir = record.irs_by_id.get(ir_id)
-                if ir is None or ir_id not in record.active_ir_runner_tasks or ir.runner_epoch != runner_epoch:
+                if gated_ticket:
+                    await ticket.cancel(outcome=LeaseReleaseOutcome.REQUEUED)
+                    admission_ticket = None
                     return
-                if self._should_requeue_active_ir_locked(record=record):
-                    self._gate_active_ir_release_locked(record=record, ir_id=ir_id, ir=ir)
-                    self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                grant = await ticket.wait()
+                lock = self._get_session_lock(session_id)
+                stale_grant = lock is None
+                gated_grant = False
+                if lock is not None:
+                    async with lock:
+                        record = self._session_records.get(session_id)
+                        active_ir = (
+                            None
+                            if record is None
+                            else self._active_ir_for_dispatch_locked(
+                                record=record,
+                                ir_id=ir_id,
+                                runner_epoch=runner_epoch,
+                                dispatch_id=dispatch_id,
+                            )
+                        )
+                        stale_grant = active_ir is None
+                        if active_ir is not None:
+                            self._record_admission_decision_locked(
+                                record=record,
+                                ir=active_ir,
+                                decision=grant.decision,
+                            )
+                            if self._should_requeue_active_ir_locked(record=record):
+                                self._gate_active_ir_release_locked(
+                                    record=record,
+                                    ir_id=ir_id,
+                                    ir=active_ir,
+                                )
+                                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                                gated_grant = True
+                if stale_grant:
+                    if grant.lease is not None:
+                        await self._scheduler().release(
+                            lease=grant.lease,
+                            outcome=LeaseReleaseOutcome.STALE,
+                        )
+                    admission_ticket = None
                     return
-                ir.backend_started = True
-                generation_profile = agentic_trace_events(ir.pending_export_metadata_patch)
+                if gated_grant:
+                    if grant.lease is not None:
+                        await self._scheduler().release(
+                            lease=grant.lease,
+                            outcome=LeaseReleaseOutcome.REQUEUED,
+                        )
+                    admission_ticket = None
+                    return
+                admission_grant = grant
+                admission_ticket = None
+                permit_acquired = await self._acquire_sglang_request_permit_for_ir()
+                if admission_grant.lease is not None and not await self._scheduler().revalidate(
+                    lease=admission_grant.lease
+                ):
+                    if permit_acquired:
+                        await self._release_sglang_request_permit_for_ir()
+                        permit_acquired = False
+                    await self._scheduler().release(
+                        lease=admission_grant.lease,
+                        outcome=LeaseReleaseOutcome.STALE,
+                    )
+                    admission_grant = None
+                    revalidation_failures += 1
+                    await asyncio.sleep(_ADMISSION_REVALIDATE_BACKOFF_S)
+                    continue
+                lock = self._get_session_lock(session_id)
+                if lock is None:
+                    return
+                async with lock:
+                    record = self._session_records.get(session_id)
+                    if record is None:
+                        return
+                    ir = self._active_ir_for_dispatch_locked(
+                        record=record,
+                        ir_id=ir_id,
+                        runner_epoch=runner_epoch,
+                        dispatch_id=dispatch_id,
+                    )
+                    if ir is None:
+                        return
+                    if self._should_requeue_active_ir_locked(record=record):
+                        self._gate_active_ir_release_locked(record=record, ir_id=ir_id, ir=ir)
+                        self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+                        return
+                    ir.backend_started = True
+                    generation_profile = agentic_trace_events(ir.pending_export_metadata_patch)
+                    return_logprob = record.scope_id == "train" or ir.logprobs
+                    input_ids = list(ir.history_rollout_token_prefix) + list(ir.pending_rollout_token_delta)
+                    sampling_params = ir.sampling_params
+                    image_data = ir.history_backend_image_data
+                    audio_data = ir.history_backend_audio_data
+                    video_data = ir.history_backend_video_data
+                    self._record_dispatch_event_locked(
+                        record=record,
+                        event_name="reasoning_started",
+                        dispatch_id=dispatch_id,
+                    )
+                break
             mark_agentic_event(generation_profile, "generation_start_at")
             result = await self.backend.generate(
-                input_ids=list(ir.history_rollout_token_prefix) + list(ir.pending_rollout_token_delta),
-                sampling_params=ir.sampling_params,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
                 session_id=session_id,
-                request_id=ir.request_id,
-                image_data=ir.history_backend_image_data,
-                audio_data=ir.history_backend_audio_data,
-                video_data=ir.history_backend_video_data,
-                return_logprob=record.scope_id == "train" or ir.logprobs,
+                request_id=dispatch_id,
+                image_data=image_data,
+                audio_data=audio_data,
+                video_data=video_data,
+                return_logprob=return_logprob,
+            )
+            lease_outcome = (
+                LeaseReleaseOutcome.REQUEUED if result.finish_type == "abort" else LeaseReleaseOutcome.COMPLETED
             )
         except BackendContextLengthExceededError:
+            lease_outcome = LeaseReleaseOutcome.FAILED
             lock = self._get_session_lock(session_id)
             if lock is None:
                 return
@@ -1942,6 +2279,23 @@ class AgenticSessionShard:
                 record = self._session_records.get(session_id)
                 if record is None:
                     return
+                ir = (
+                    None
+                    if dispatch_id is None
+                    else self._active_ir_for_dispatch_locked(
+                        record=record,
+                        ir_id=ir_id,
+                        runner_epoch=runner_epoch,
+                        dispatch_id=dispatch_id,
+                    )
+                )
+                if ir is None:
+                    return
+                self._record_dispatch_event_locked(
+                    record=record,
+                    event_name="reasoning_finished",
+                    dispatch_id=dispatch_id,
+                )
                 self._complete_waiter_locked(
                     record,
                     ir_id,
@@ -1955,6 +2309,7 @@ class AgenticSessionShard:
                 self._maybe_start_next_ir_locked(session_id=session_id, record=record)
             return
         except Exception as exc:
+            lease_outcome = LeaseReleaseOutcome.FAILED
             if generation_profile is not None:
                 mark_agentic_event(generation_profile, "generation_end_at")
             lock = self._get_session_lock(session_id)
@@ -1964,26 +2319,71 @@ class AgenticSessionShard:
                 record = self._session_records.get(session_id)
                 if record is None:
                     return
-                ir = record.irs_by_id.get(ir_id)
+                ir = (
+                    None
+                    if dispatch_id is None
+                    else self._active_ir_for_dispatch_locked(
+                        record=record,
+                        ir_id=ir_id,
+                        runner_epoch=runner_epoch,
+                        dispatch_id=dispatch_id,
+                    )
+                )
                 if (
                     ir is not None
-                    and ir_id in record.active_ir_runner_tasks
                     and self._should_requeue_active_ir_locked(record=record)
                     and self._is_interrupt_backpressure_error(exc)
                 ):
+                    lease_outcome = LeaseReleaseOutcome.REQUEUED
+                    if ir.backend_started:
+                        self._record_dispatch_event_locked(
+                            record=record,
+                            event_name="reasoning_finished",
+                            dispatch_id=dispatch_id,
+                        )
                     self._requeue_aborted_ir_locked(record=record, ir_id=ir_id, ir=ir)
                     self._maybe_start_next_ir_locked(session_id=session_id, record=record)
                     return
+                if ir is not None and ir.backend_started:
+                    self._record_dispatch_event_locked(
+                        record=record,
+                        event_name="reasoning_finished",
+                        dispatch_id=dispatch_id,
+                    )
                 self._complete_waiter_locked(record, ir_id, exc=exc)
                 self._release_ir_locked(record, ir_id)
                 self._maybe_start_next_ir_locked(session_id=session_id, record=record)
             return
         finally:
-            if permit_acquired:
-                if self._sglang_request_semaphore is not None:
-                    self._sglang_request_semaphore.release()
-                else:
-                    await self._sglang_request_limiter.release_sglang_request_permit.remote()
+            try:
+                try:
+                    if permit_acquired:
+                        await self._release_sglang_request_permit_for_ir()
+                except Exception:
+                    logger.exception(
+                        "Failed to release SGLang request permit for dispatch_id=%s",
+                        dispatch_id,
+                    )
+            finally:
+                if admission_ticket is not None:
+                    try:
+                        await admission_ticket.cancel(outcome=lease_outcome)
+                    except Exception:
+                        logger.exception(
+                            "Failed to cancel agentic admission ticket for dispatch_id=%s",
+                            dispatch_id,
+                        )
+                elif admission_grant is not None and admission_grant.lease is not None:
+                    try:
+                        await self._scheduler().release(
+                            lease=admission_grant.lease,
+                            outcome=lease_outcome,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to release agentic admission lease for dispatch_id=%s",
+                            dispatch_id,
+                        )
 
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -1992,11 +2392,25 @@ class AgenticSessionShard:
             record = self._session_records.get(session_id)
             if record is None:
                 return
-            ir = record.irs_by_id.get(ir_id)
-            if ir is None or ir_id not in record.active_ir_runner_tasks:
+            ir = (
+                None
+                if dispatch_id is None
+                else self._active_ir_for_dispatch_locked(
+                    record=record,
+                    ir_id=ir_id,
+                    runner_epoch=runner_epoch,
+                    dispatch_id=dispatch_id,
+                )
+            )
+            if ir is None:
                 return
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(profile, "generation_end_at")
+            self._record_dispatch_event_locked(
+                record=record,
+                event_name="reasoning_finished",
+                dispatch_id=dispatch_id,
+            )
             self._apply_generate_result(ir, result=result)
             finish_type = result.finish_type
             # SGLang may process an abort after the decode step that produced EOS, returning
@@ -2491,8 +2905,23 @@ class AgenticSessionShard:
             if not active_runner_task.done():
                 active_runner_task.cancel()
         await self._abort_backend_request_ids(backend_request_ids)
-        for active_runner_task in active_tasks:
+        if active_tasks:
+            done_tasks, pending_tasks = await asyncio.wait(
+                active_tasks,
+                timeout=_AGENTIC_RUNNER_CLEANUP_TIMEOUT_S,
+            )
+        else:
+            done_tasks, pending_tasks = set(), set()
+        for active_runner_task in done_tasks:
+            _log_discarded_runner_result(active_runner_task)
+        for active_runner_task in pending_tasks:
             active_runner_task.add_done_callback(_log_discarded_runner_result)
+        if pending_tasks:
+            logger.warning(
+                "Discarded agentic session session_id=%s has %s IR runner cleanup task(s) still pending.",
+                session_id,
+                len(pending_tasks),
+            )
         for waiter in waiters:
             if waiter.done():
                 continue
@@ -2542,7 +2971,9 @@ class AgenticSessionShard:
                 credential_session_ids.pop(credential_digest, None)
             active_tasks = list(removed.active_ir_runner_tasks.values())
             waiters = list(removed.pending_chat_waiters.values())
-            backend_request_ids = [ir.request_id for ir in removed.irs_by_id.values() if ir.backend_started]
+            backend_request_ids = [
+                ir.active_dispatch_id or ir.request_id for ir in removed.irs_by_id.values() if ir.backend_started
+            ]
             self._clear_removed_record_state(removed)
         return removed, stats, active_tasks, waiters, backend_request_ids
 

@@ -13,8 +13,12 @@ from relax.agentic.pipeline.runtime import SGLangBackendAdapter
 from relax.agentic.session.contracts import (
     AdmissionAction,
     AdmissionDecision,
+    AdmissionGrant,
+    AdmissionLease,
     AdmissionReason,
     AgenticIdentity,
+    BudgetAcquireResult,
+    BudgetAcquireStatus,
     RouteObservation,
     RoutingContext,
 )
@@ -114,6 +118,59 @@ def test_admission_decision_allows_explicit_bypass() -> None:
         owner_epoch=0,
     )
     assert decision.action == AdmissionAction.BYPASS
+
+
+def test_admission_lease_and_grant_require_matching_fencing_fields() -> None:
+    lease = AdmissionLease(
+        owner_epoch=7,
+        dispatch_id="dispatch-1",
+        admission_decision_id="decision-1",
+        reservation_tokens=48,
+        ttl_s=60.0,
+        expires_at_local_monotonic=100.0,
+    )
+    decision = AdmissionDecision(
+        action=AdmissionAction.ADMIT,
+        reason_code=AdmissionReason.CAPACITY_AVAILABLE,
+        reservation_tokens=48,
+        admission_decision_id="decision-1",
+        owner_epoch=7,
+    )
+
+    assert AdmissionGrant(decision=decision, lease=lease).lease == lease
+    with pytest.raises(ValueError, match="does not match"):
+        AdmissionGrant(
+            decision=decision,
+            lease=AdmissionLease(
+                owner_epoch=7,
+                dispatch_id="dispatch-1",
+                admission_decision_id="decision-other",
+                reservation_tokens=48,
+                ttl_s=60.0,
+                expires_at_local_monotonic=100.0,
+            ),
+        )
+
+
+@pytest.mark.parametrize("owner_epoch", [0, -1, False])
+def test_admission_lease_requires_positive_owner_epoch(owner_epoch: int) -> None:
+    with pytest.raises(ValueError, match="owner_epoch"):
+        AdmissionLease(
+            owner_epoch=owner_epoch,
+            dispatch_id="dispatch-1",
+            admission_decision_id="decision-1",
+            reservation_tokens=1,
+            ttl_s=60.0,
+            expires_at_local_monotonic=100.0,
+        )
+
+
+def test_budget_acquire_result_only_carries_lease_when_acquired() -> None:
+    with pytest.raises(ValueError, match="requires a lease"):
+        BudgetAcquireResult(
+            status=BudgetAcquireStatus.ACQUIRED,
+            reason_code=AdmissionReason.CAPACITY_AVAILABLE,
+        )
 
 
 @pytest.mark.parametrize("owner_epoch", [-1, False])

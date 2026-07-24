@@ -394,6 +394,10 @@ class InflightRequest:
     rollout_id: int
     kind: RequestKind
     abort_count: int
+    attempt_id: str = ""
+    active_dispatch_id: str | None = None
+    admission_decision_id: str | None = None
+    admission_action: str | None = None
     sampling_params: dict[str, Any] = field(default_factory=dict)
     logprobs: bool = False
     history_train_token_prefix: list[int] = field(default_factory=list)
