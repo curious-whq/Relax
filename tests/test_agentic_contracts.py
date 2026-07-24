@@ -31,6 +31,7 @@ from relax.agentic.session.sglang_capabilities import (
     resolve_sglang_capability_profile,
     unavailable_sglang_capability_profile,
 )
+from relax.agentic.session.sglang_lifecycle import EngineSessionLifecycleState
 from relax.agentic.session.state import InflightRequest, RequestKind
 
 
@@ -508,6 +509,7 @@ async def test_session_shard_builds_backend_request_from_complete_replay(
     record = _SessionRecord(
         scope_id="train",
         identity=_identity(engine_session_id=identity_session_id),
+        lifecycle_state=EngineSessionLifecycleState.ACTIVE,
     )
     record.irs_by_id[request.request_id] = request
     record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()

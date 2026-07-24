@@ -63,6 +63,12 @@ from relax.agentic.session.sglang_capabilities import (
     resolve_sglang_capability_profile,
     unavailable_sglang_capability_profile,
 )
+from relax.agentic.session.sglang_lifecycle import (
+    EngineSessionLifecycleState,
+    SessionControlStatus,
+    SGLangSessionControlPort,
+    SGLangWorkerTarget,
+)
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
@@ -87,6 +93,8 @@ AGENTIC_SESSION_SHARD_NAME_PREFIX = "agentic_session_shard"
 _DEFAULT_SESSION_SHARD_COUNT = 16
 _STALE_SESSION_SHARD_CLEANUP_LIMIT = 64
 _TERMINATED_PROGRAM_TOMBSTONE_LIMIT = 8192
+_CLOSE_TOMBSTONE_LIMIT = 8192
+_CLOSE_TOMBSTONE_TTL_S = 600.0
 _AGENTIC_SHARD_ALLOCATOR_ENV = {
     "MALLOC_ARENA_MAX": "2",
     "MALLOC_TRIM_THRESHOLD_": "0",
@@ -115,9 +123,7 @@ def deploy_agentic_chat_api_services(*, config, runtime_env) -> None:
             getattr(config, "sglang_enable_hierarchical_cache", False)
             or getattr(config, "sglang_enable_hisparse", False)
         ),
-        # Session control cannot be activated until Phase 5 supplies bounded
-        # open/close fan-out and close tombstones.
-        lifecycle_ready=False,
+        lifecycle_ready=True,
     )
     router_ip, router_port = _start_router(config, has_pd_disaggregation=has_pd, force_new=False)
     config.sglang_router_ip = router_ip
@@ -203,6 +209,8 @@ class _SessionRecord:
     protected_until_finalize: bool = False
     identity: AgenticIdentity | None = None
     credential_digest: str | None = None
+    lifecycle_state: EngineSessionLifecycleState = EngineSessionLifecycleState.BYPASS
+    lifecycle_targets: tuple[SGLangWorkerTarget, ...] = ()
 
 
 @dataclass
@@ -216,6 +224,20 @@ class _ProgramRecord:
     next_event_seq: int = 1
     event_seq_by_id: dict[str, int] = field(default_factory=dict)
     finalized: bool = False
+
+
+@dataclass
+class _CloseTombstone:
+    program_owner_key: str
+    engine_session_id: str
+    owner_epoch: int
+    event_id: str
+    transport: FinalizedResultTransport
+    completion: asyncio.Future[bool]
+    state: EngineSessionLifecycleState = EngineSessionLifecycleState.TERMINATING
+    targets: tuple[SGLangWorkerTarget, ...] = ()
+    event_seq: int | None = None
+    expires_at_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -789,10 +811,16 @@ class AgenticSessionShard:
             self.args = Namespace(**dict(config_payload or {}))
         init_http_client(self.args)
         resources = get_agentic_runtime_resources(self.args)
+        capability_profile = sglang_capability_profile or unavailable_sglang_capability_profile()
         self.backend = SGLangBackendAdapter(
             self.args,
             compiler_resources=resources.compiler,
-            capability_profile=sglang_capability_profile or unavailable_sglang_capability_profile(),
+            capability_profile=capability_profile,
+        )
+        self._session_control_port = SGLangSessionControlPort(
+            router_ip=getattr(self.args, "sglang_router_ip", None),
+            router_port=getattr(self.args, "sglang_router_port", None),
+            capability_profile=capability_profile,
         )
         self._shard_index = int(shard_index)
         self._shard_count = int(shard_count)
@@ -806,6 +834,8 @@ class AgenticSessionShard:
         self._credential_session_ids: dict[str, str] = {}
         self._session_records: dict[str, _SessionRecord] = {}
         self._session_locks: dict[str, Any] = {}
+        self._close_tombstones: dict[str, _CloseTombstone] = {}
+        self._close_tombstone_order: deque[str] = deque()
         self._admission_budget_port = (
             None
             if admission_budget_coordinator is None
@@ -1087,6 +1117,39 @@ class AgenticSessionShard:
             "node_count": len(forest.nodes_by_hash) if forest is not None else 0,
         }
 
+    def _tombstone_store(self) -> tuple[dict[str, _CloseTombstone], deque[str]]:
+        tombstones = getattr(self, "_close_tombstones", None)
+        if tombstones is None:
+            tombstones = {}
+            self._close_tombstones = tombstones
+        order = getattr(self, "_close_tombstone_order", None)
+        if order is None:
+            order = deque()
+            self._close_tombstone_order = order
+        return tombstones, order
+
+    def _prune_close_tombstones(self) -> None:
+        tombstones, order = self._tombstone_store()
+        now = time.monotonic()
+        while order:
+            session_id = order[0]
+            tombstone = tombstones.get(session_id)
+            if tombstone is None:
+                order.popleft()
+                continue
+            if not tombstone.completion.done() or tombstone.expires_at_monotonic > now:
+                break
+            order.popleft()
+            tombstones.pop(session_id, None)
+
+    def _initial_lifecycle_state(self) -> EngineSessionLifecycleState:
+        self._prune_close_tombstones()
+        tombstones, _ = self._tombstone_store()
+        port = getattr(self, "_session_control_port", None)
+        if port is None or not port.enabled or len(tombstones) >= _CLOSE_TOMBSTONE_LIMIT:
+            return EngineSessionLifecycleState.BYPASS
+        return EngineSessionLifecycleState.UNOPENED
+
     def _template_kwargs(self) -> dict[str, Any]:
         compiler = getattr(self.backend, "compiler", None)
         return normalize_template_kwargs(getattr(compiler, "apply_chat_template_kwargs", None))
@@ -1161,6 +1224,11 @@ class AgenticSessionShard:
         )
         credential_digest = hashlib.sha256(credential.encode("utf-8")).hexdigest()
         session_id = identity.engine_session_id
+        self._prune_close_tombstones()
+        close_tombstones, _ = self._tombstone_store()
+        tombstone = close_tombstones.get(session_id)
+        if tombstone is not None:
+            raise RuntimeError("Cannot reopen a tombstoned agentic engine session.")
         existing_record = self._session_records.get(session_id)
         if existing_record is not None and (
             existing_record.identity != identity or existing_record.credential_digest != credential_digest
@@ -1220,6 +1288,7 @@ class AgenticSessionShard:
                         group_generation=group_generation,
                         identity=identity,
                         credential_digest=credential_digest,
+                        lifecycle_state=self._initial_lifecycle_state(),
                     )
                     self._set_session_gate_locked(record=record, gate_reason=gate_reason)
                     self._session_records[session_id] = record
@@ -2195,6 +2264,52 @@ class AgenticSessionShard:
             await asyncio.gather(backend_task, return_exceptions=True)
         return None, lease_holder[0], True
 
+    async def _ensure_engine_session_open(self, *, session_id: str) -> bool:
+        lock = self._get_session_lock(session_id)
+        if lock is None:
+            return False
+        async with lock:
+            record = self._session_records.get(session_id)
+            if record is None:
+                return False
+            lifecycle_state = getattr(record, "lifecycle_state", EngineSessionLifecycleState.BYPASS)
+            if lifecycle_state == EngineSessionLifecycleState.ACTIVE:
+                return True
+            if lifecycle_state != EngineSessionLifecycleState.UNOPENED:
+                return False
+            identity = record.identity
+            if identity is None or identity.engine_session_id != session_id:
+                record.lifecycle_state = EngineSessionLifecycleState.BYPASS
+                return False
+            record.lifecycle_state = EngineSessionLifecycleState.OPENING
+        port = getattr(self, "_session_control_port", None)
+        if port is None:
+            result = None
+        else:
+            result = await port.open_session(
+                engine_session_id=session_id,
+                capacity_of_str_len=max(1, int(getattr(self.args, "rollout_max_context_len", 1) or 1)),
+            )
+        opened = result is not None and result.status == SessionControlStatus.OPENED
+        lock = self._get_session_lock(session_id)
+        stale = lock is None
+        if lock is not None:
+            async with lock:
+                record = self._session_records.get(session_id)
+                stale = record is None or record.lifecycle_state != EngineSessionLifecycleState.OPENING
+                if not stale:
+                    record.lifecycle_targets = result.targets if result is not None else ()
+                    record.lifecycle_state = (
+                        EngineSessionLifecycleState.ACTIVE if opened else EngineSessionLifecycleState.BYPASS
+                    )
+        if stale and opened and port is not None:
+            await port.close_session(
+                engine_session_id=session_id,
+                known_targets=result.targets,
+            )
+            return False
+        return opened
+
     async def _run_ir(self, *, session_id: str, ir_id: str, runner_epoch: int) -> None:
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -2212,6 +2327,7 @@ class AgenticSessionShard:
                 return
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             mark_agentic_event(profile, "generation_queue_enter_at")
+        await self._ensure_engine_session_open(session_id=session_id)
         permit_acquired = False
         admission_grant: AdmissionGrant | None = None
         admission_ticket: AdmissionTicket | None = None
@@ -2396,7 +2512,10 @@ class AgenticSessionShard:
                     identity = getattr(record, "identity", None)
                     engine_session_id = (
                         identity.engine_session_id
-                        if identity is not None and identity.engine_session_id == session_id
+                        if identity is not None
+                        and identity.engine_session_id == session_id
+                        and getattr(record, "lifecycle_state", EngineSessionLifecycleState.BYPASS)
+                        == EngineSessionLifecycleState.ACTIVE
                         else None
                     )
                     self._record_dispatch_event_locked(
@@ -3059,9 +3178,19 @@ class AgenticSessionShard:
                 error_type="internal_error",
             )
 
-    async def _abort_backend_request_ids(self, request_ids: list[str]) -> None:
+    async def _abort_backend_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        known_targets: tuple[SGLangWorkerTarget, ...] = (),
+    ) -> None:
         if not request_ids:
             return
+        port = getattr(self, "_session_control_port", None)
+        if port is not None and port.enabled:
+            if await port.abort_requests(request_ids=request_ids, known_targets=known_targets):
+                return
+            raise RuntimeError("Failed to abort all active agentic session requests.")
         urls = await _sglang_worker_urls(self.args)
         if not urls:
             raise RuntimeError(
@@ -3078,6 +3207,8 @@ class AgenticSessionShard:
     async def _finish_discarded_session(
         self,
         *,
+        control_ref: SessionControlRef,
+        tombstone: _CloseTombstone,
         session_id: str,
         lock: asyncio.Lock,
         removed: _SessionRecord | None,
@@ -3101,12 +3232,21 @@ class AgenticSessionShard:
         for active_runner_task in active_tasks:
             if not active_runner_task.done():
                 active_runner_task.cancel()
-        await self._abort_backend_request_ids(backend_request_ids)
-        if active_tasks:
-            done_tasks, pending_tasks = await asyncio.wait(
-                active_tasks,
-                timeout=_AGENTIC_RUNNER_CLEANUP_TIMEOUT_S,
+        abort_succeeded = True
+        try:
+            await self._abort_backend_request_ids(
+                backend_request_ids,
+                known_targets=tombstone.targets,
             )
+        except Exception as exc:
+            abort_succeeded = False
+            logger.warning(
+                "Failed to abort backend requests before closing agentic session session_id=%s: %s",
+                session_id,
+                exc,
+            )
+        if active_tasks:
+            done_tasks, pending_tasks = await asyncio.wait(active_tasks, timeout=_AGENTIC_RUNNER_CLEANUP_TIMEOUT_S)
         else:
             done_tasks, pending_tasks = set(), set()
         for active_runner_task in done_tasks:
@@ -3119,6 +3259,31 @@ class AgenticSessionShard:
                 session_id,
                 len(pending_tasks),
             )
+        safe_to_close = abort_succeeded and not pending_tasks
+        close_succeeded = False
+        port = getattr(self, "_session_control_port", None)
+        if safe_to_close and port is not None:
+            tombstone.state = EngineSessionLifecycleState.CLOSE_IN_FLIGHT
+            try:
+                close_result = await port.close_session(
+                    engine_session_id=session_id,
+                    known_targets=tombstone.targets,
+                )
+                tombstone.targets = close_result.targets
+                close_succeeded = close_result.succeeded
+            except Exception as exc:
+                logger.warning(
+                    "Failed to close agentic engine session session_id=%s: %s",
+                    session_id,
+                    exc,
+                )
+        elif safe_to_close:
+            close_succeeded = True
+        tombstone.state = (
+            EngineSessionLifecycleState.TERMINATED_OK
+            if close_succeeded
+            else EngineSessionLifecycleState.TERMINATED_EXHAUSTED
+        )
         for waiter in waiters:
             if waiter.done():
                 continue
@@ -3145,6 +3310,17 @@ class AgenticSessionShard:
                 len(self._session_records),
                 len(self._session_locks),
             )
+        async with self._ensure_program_lock(control_ref.program_owner_key):
+            program = self._program_records.get(control_ref.program_owner_key)
+            if program is not None and program.owner_epoch == control_ref.owner_epoch:
+                tombstone.event_seq = self._mark_engine_session_terminal_locked(
+                    program=program,
+                    session_id=session_id,
+                    event_id=tombstone.event_id,
+                )
+        tombstone.expires_at_monotonic = time.monotonic() + _CLOSE_TOMBSTONE_TTL_S
+        if not tombstone.completion.done():
+            tombstone.completion.set_result(close_succeeded)
         return removed is not None
 
     def _discard_session_locked(
@@ -3185,6 +3361,44 @@ class AgenticSessionShard:
             return None
         return program
 
+    def _close_tombstone_for_control_ref(
+        self,
+        *,
+        control_ref: SessionControlRef,
+    ) -> _CloseTombstone | None:
+        self._prune_close_tombstones()
+        tombstones, _ = self._tombstone_store()
+        tombstone = tombstones.get(control_ref.engine_session_id)
+        if (
+            tombstone is None
+            or tombstone.program_owner_key != control_ref.program_owner_key
+            or tombstone.owner_epoch != control_ref.owner_epoch
+        ):
+            return None
+        return tombstone
+
+    def _create_close_tombstone(
+        self,
+        *,
+        control_ref: SessionControlRef,
+        event_id: str,
+        transport: FinalizedResultTransport,
+        targets: tuple[SGLangWorkerTarget, ...],
+    ) -> _CloseTombstone:
+        tombstones, order = self._tombstone_store()
+        tombstone = _CloseTombstone(
+            program_owner_key=control_ref.program_owner_key,
+            engine_session_id=control_ref.engine_session_id,
+            owner_epoch=control_ref.owner_epoch,
+            event_id=event_id,
+            transport=transport,
+            completion=asyncio.get_running_loop().create_future(),
+            targets=targets,
+        )
+        tombstones[control_ref.engine_session_id] = tombstone
+        order.append(control_ref.engine_session_id)
+        return tombstone
+
     def _mark_engine_session_terminal_locked(
         self,
         *,
@@ -3217,98 +3431,119 @@ class AgenticSessionShard:
     ) -> FinalizedResultTransport:
         session_id = control_ref.engine_session_id
         finalize_arrive_at = time.time()
+        existing_tombstone: _CloseTombstone | None = None
         async with self._ensure_program_lock(control_ref.program_owner_key):
-            program = self._program_for_control_ref(control_ref=control_ref)
-            if program is None:
-                return FinalizedResultTransport(
-                    status="discarded",
-                    metadata={"discard_reason": "stale_or_discarded_owner"},
-                )
-            lock = self._get_session_lock(session_id)
-            if lock is None:
-                return FinalizedResultTransport(
-                    status="discarded",
-                    metadata={"discard_reason": "already_discarded"},
-                )
-            active_tasks: list[asyncio.Task[Any]] = []
-            waiters: list[asyncio.Future[Any]] = []
-            removed = None
-            stats = None
-            transport = None
-            async with lock:
-                finalize_lock_acquired_at = time.time()
-                record = self._session_records.get(session_id)
-                if record is None:
+            existing_tombstone = self._close_tombstone_for_control_ref(control_ref=control_ref)
+            if existing_tombstone is None:
+                program = self._program_for_control_ref(control_ref=control_ref)
+                if program is None:
+                    return FinalizedResultTransport(
+                        status="discarded",
+                        metadata={"discard_reason": "stale_or_discarded_owner"},
+                    )
+                lock = self._get_session_lock(session_id)
+                if lock is None:
                     return FinalizedResultTransport(
                         status="discarded",
                         metadata={"discard_reason": "already_discarded"},
                     )
-                leaf_node = self._exportable_leaf_node(record)
-                if leaf_node is None:
-                    transport = FinalizedResultTransport(
-                        status="non_finalizable",
-                        metadata={"discard_reason": "no_committed_response"},
+                async with lock:
+                    finalize_lock_acquired_at = time.time()
+                    record = self._session_records.get(session_id)
+                    if record is None:
+                        return FinalizedResultTransport(
+                            status="discarded",
+                            metadata={"discard_reason": "already_discarded"},
+                        )
+                    leaf_node = self._exportable_leaf_node(record)
+                    if leaf_node is None:
+                        transport = FinalizedResultTransport(
+                            status="non_finalizable",
+                            metadata={"discard_reason": "no_committed_response"},
+                        )
+                    else:
+                        profile = agentic_trace_events(leaf_node.export_metadata_patch)
+                        mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
+                        mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
+                        sample = self._finalize_sample_from_leaf(
+                            record=record,
+                            leaf_node=leaf_node,
+                            reward=reward,
+                            metadata=metadata,
+                        )
+                        transport = self._build_transport_from_sample(sample)
+                    record.lifecycle_state = EngineSessionLifecycleState.TERMINATING
+                    tombstone = self._create_close_tombstone(
+                        control_ref=control_ref,
+                        event_id=f"engine_session_finalize:{session_id}",
+                        transport=transport,
+                        targets=record.lifecycle_targets,
                     )
-                else:
-                    profile = agentic_trace_events(leaf_node.export_metadata_patch)
-                    mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
-                    mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
-                    sample = self._finalize_sample_from_leaf(
-                        record=record,
-                        leaf_node=leaf_node,
-                        reward=reward,
-                        metadata=metadata,
+                    removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
+                        session_id=session_id
                     )
-                    transport = self._build_transport_from_sample(sample)
-                removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                    session_id=session_id
-                )
-                self._mark_engine_session_terminal_locked(
-                    program=program,
-                    session_id=session_id,
-                    event_id=f"engine_session_finalize:{session_id}",
-                )
-        await self._finish_discarded_session(
-            session_id=session_id,
-            lock=lock,
-            removed=removed,
-            active_tasks=active_tasks,
-            backend_request_ids=backend_request_ids,
-            waiters=waiters,
-            stats=stats,
+        if existing_tombstone is not None:
+            await asyncio.shield(existing_tombstone.completion)
+            return existing_tombstone.transport
+        await asyncio.shield(
+            self._finish_discarded_session(
+                control_ref=control_ref,
+                tombstone=tombstone,
+                session_id=session_id,
+                lock=lock,
+                removed=removed,
+                active_tasks=active_tasks,
+                backend_request_ids=backend_request_ids,
+                waiters=waiters,
+                stats=stats,
+            )
         )
         return transport
 
     async def discard_session(self, *, control_ref: SessionControlRef) -> bool:
         session_id = control_ref.engine_session_id
+        existing_tombstone: _CloseTombstone | None = None
         async with self._ensure_program_lock(control_ref.program_owner_key):
-            program = self._program_for_control_ref(control_ref=control_ref)
-            if program is None:
-                return False
-            lock = self._get_session_lock(session_id)
-            if lock is None:
-                return False
-            active_tasks: list[asyncio.Task[Any]] = []
-            waiters: list[asyncio.Future[Any]] = []
-            removed = None
-            stats = None
-            async with lock:
-                removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
-                    session_id=session_id
-                )
-                self._mark_engine_session_terminal_locked(
-                    program=program,
-                    session_id=session_id,
-                    event_id=f"engine_session_discard:{session_id}",
-                )
-        return await self._finish_discarded_session(
-            session_id=session_id,
-            lock=lock,
-            removed=removed,
-            active_tasks=active_tasks,
-            backend_request_ids=backend_request_ids,
-            waiters=waiters,
-            stats=stats,
+            existing_tombstone = self._close_tombstone_for_control_ref(control_ref=control_ref)
+            if existing_tombstone is None:
+                program = self._program_for_control_ref(control_ref=control_ref)
+                if program is None:
+                    return False
+                lock = self._get_session_lock(session_id)
+                if lock is None:
+                    return False
+                async with lock:
+                    record = self._session_records.get(session_id)
+                    if record is None:
+                        return False
+                    record.lifecycle_state = EngineSessionLifecycleState.TERMINATING
+                    tombstone = self._create_close_tombstone(
+                        control_ref=control_ref,
+                        event_id=f"engine_session_finalize:{session_id}",
+                        transport=FinalizedResultTransport(
+                            status="discarded",
+                            metadata={"discard_reason": "explicit_discard"},
+                        ),
+                        targets=record.lifecycle_targets,
+                    )
+                    removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
+                        session_id=session_id
+                    )
+        if existing_tombstone is not None:
+            await asyncio.shield(existing_tombstone.completion)
+            return True
+        return await asyncio.shield(
+            self._finish_discarded_session(
+                control_ref=control_ref,
+                tombstone=tombstone,
+                session_id=session_id,
+                lock=lock,
+                removed=removed,
+                active_tasks=active_tasks,
+                backend_request_ids=backend_request_ids,
+                waiters=waiters,
+                stats=stats,
+            )
         )
 
 
