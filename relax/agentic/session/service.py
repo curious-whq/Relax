@@ -37,11 +37,21 @@ from relax.agentic.profile import (
     mark_agentic_event_once,
     mark_metadata_agentic_event,
 )
-from relax.agentic.session.admission import AdmissionTicket, ProgramScheduler
+from relax.agentic.session.admission import (
+    AdmissionBudgetUnknownRenewalOutcome,
+    AdmissionTicket,
+    ProgramScheduler,
+)
+from relax.agentic.session.admission_budget import (
+    RayAdmissionBudgetPort,
+    create_admission_budget_coordinator,
+    shutdown_admission_budget_coordinator,
+)
 from relax.agentic.session.contracts import (
     AdmissionAction,
     AdmissionDecision,
     AdmissionGrant,
+    AdmissionLease,
     AdmissionReason,
     AgenticIdentity,
     LeaseReleaseOutcome,
@@ -114,6 +124,7 @@ def shutdown_agentic_chat_api_services() -> None:
             ray.kill(ray.get_actor(agentic_session_shard_name(idx)), no_restart=True)
         except Exception:
             pass
+    shutdown_admission_budget_coordinator()
     logger.info("Agentic chat API services shut down.")
 
 
@@ -147,6 +158,8 @@ _ADMISSION_PRIORITY_BY_REQUEST_KIND = {
 }
 _ADMISSION_REVALIDATE_FAILURE_LIMIT = 3
 _ADMISSION_REVALIDATE_BACKOFF_S = 0.01
+_ADMISSION_LEASE_RENEW_MIN_INTERVAL_S = 0.01
+_ADMISSION_LEASE_RENEW_MAX_INTERVAL_S = 5.0
 _AGENTIC_RUNNER_CLEANUP_TIMEOUT_S = 1.0
 
 
@@ -743,8 +756,10 @@ class AgenticSessionShard:
         *,
         sglang_request_capacity: int | None = None,
         sglang_request_limiter: Any | None = None,
+        admission_budget_coordinator: Any | None = None,
         shard_index: int = 0,
         shard_count: int = 1,
+        owner_epoch: int | None = None,
     ) -> None:
         if isinstance(config_payload, Namespace):
             self.args = config_payload
@@ -755,7 +770,9 @@ class AgenticSessionShard:
         self.backend = SGLangBackendAdapter(self.args, compiler_resources=resources.compiler)
         self._shard_index = int(shard_index)
         self._shard_count = int(shard_count)
-        self._owner_epoch = secrets.randbits(63) or 1
+        self._owner_epoch = int(owner_epoch) if owner_epoch is not None else (secrets.randbits(63) or 1)
+        if self._owner_epoch <= 0:
+            raise ValueError("owner_epoch must be positive")
         self._program_records: dict[str, _ProgramRecord] = {}
         self._program_locks: dict[str, asyncio.Lock] = {}
         self._registration_lock = asyncio.Lock()
@@ -763,7 +780,12 @@ class AgenticSessionShard:
         self._credential_session_ids: dict[str, str] = {}
         self._session_records: dict[str, _SessionRecord] = {}
         self._session_locks: dict[str, Any] = {}
-        self._program_scheduler = ProgramScheduler()
+        self._admission_budget_port = (
+            None
+            if admission_budget_coordinator is None
+            else RayAdmissionBudgetPort(coordinator=admission_budget_coordinator)
+        )
+        self._program_scheduler = ProgramScheduler(budget_port=self._admission_budget_port)
         self._permit_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._evaluating = 0
         self._terminal_ir_gate_closed = False
@@ -771,6 +793,14 @@ class AgenticSessionShard:
             threading.BoundedSemaphore(sglang_request_capacity) if sglang_request_capacity is not None else None
         )
         self._sglang_request_limiter = sglang_request_limiter
+
+    async def register_admission_budget_owner(self) -> None:
+        if self._admission_budget_port is None:
+            return
+        await self._admission_budget_port.register_owner(
+            shard_id=self._shard_index,
+            owner_epoch=self._owner_epoch,
+        )
 
     def _ensure_session_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -2060,6 +2090,85 @@ class AgenticSessionShard:
             return None
         return ir
 
+    async def _renew_admission_lease(
+        self,
+        *,
+        initial_lease: AdmissionLease,
+        lease_holder: list[AdmissionLease],
+    ) -> bool:
+        lease = initial_lease
+        while True:
+            remaining_s = lease.expires_at_local_monotonic - time.monotonic()
+            renew_interval_s = max(
+                _ADMISSION_LEASE_RENEW_MIN_INTERVAL_S,
+                min(remaining_s / 3.0, _ADMISSION_LEASE_RENEW_MAX_INTERVAL_S),
+            )
+            await asyncio.sleep(renew_interval_s)
+            try:
+                renewed_lease = await self._scheduler().renew(lease=lease)
+            except AdmissionBudgetUnknownRenewalOutcome as exc:
+                logger.warning(
+                    "Admission lease renewal is unavailable for in-flight dispatch_id=%s; "
+                    "allowing the existing decode to finish: %s",
+                    lease.dispatch_id,
+                    exc,
+                )
+                return True
+            if renewed_lease is None:
+                return False
+            lease = renewed_lease
+            lease_holder[0] = renewed_lease
+
+    async def _generate_with_admission_lease(
+        self,
+        *,
+        lease: AdmissionLease | None,
+        dispatch_id: str,
+        generate_kwargs: dict[str, Any],
+    ) -> tuple[Any | None, AdmissionLease | None, bool]:
+        if lease is None:
+            return await self.backend.generate(**generate_kwargs), None, False
+        lease_holder = [lease]
+        backend_task = asyncio.create_task(self.backend.generate(**generate_kwargs))
+        renewal_task = asyncio.create_task(
+            self._renew_admission_lease(
+                initial_lease=lease,
+                lease_holder=lease_holder,
+            )
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {backend_task, renewal_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:
+            backend_task.cancel()
+            renewal_task.cancel()
+            await asyncio.gather(backend_task, renewal_task, return_exceptions=True)
+            raise
+        if backend_task in done:
+            renewal_task.cancel()
+            await asyncio.gather(renewal_task, return_exceptions=True)
+            return backend_task.result(), lease_holder[0], False
+        if backend_task.done():
+            return backend_task.result(), lease_holder[0], False
+        try:
+            renewal_valid = renewal_task.result()
+        except Exception:
+            renewal_valid = True
+            logger.exception(
+                "Admission lease renewal raised for in-flight dispatch_id=%s; allowing the existing decode to finish",
+                dispatch_id,
+            )
+        if renewal_valid:
+            return await backend_task, lease_holder[0], False
+        try:
+            await self._abort_backend_request_ids([dispatch_id])
+        finally:
+            backend_task.cancel()
+            await asyncio.gather(backend_task, return_exceptions=True)
+        return None, lease_holder[0], True
+
     async def _run_ir(self, *, session_id: str, ir_id: str, runner_epoch: int) -> None:
         lock = self._get_session_lock(session_id)
         if lock is None:
@@ -2086,6 +2195,8 @@ class AgenticSessionShard:
         revalidation_failures = 0
         try:
             while True:
+                lease_outcome = LeaseReleaseOutcome.CANCELLED
+                generation_profile = None
                 lock = self._get_session_lock(session_id)
                 if lock is None:
                     return
@@ -2209,9 +2320,15 @@ class AgenticSessionShard:
                 admission_grant = grant
                 admission_ticket = None
                 permit_acquired = await self._acquire_sglang_request_permit_for_ir()
-                if admission_grant.lease is not None and not await self._scheduler().revalidate(
-                    lease=admission_grant.lease
-                ):
+                activated_lease = admission_grant.lease
+                if activated_lease is not None:
+                    activated_lease = await self._scheduler().activate(lease=activated_lease)
+                    if activated_lease is not None:
+                        admission_grant = AdmissionGrant(
+                            decision=admission_grant.decision,
+                            lease=activated_lease,
+                        )
+                if admission_grant.lease is not None and activated_lease is None:
                     if permit_acquired:
                         await self._release_sglang_request_permit_for_ir()
                         permit_acquired = False
@@ -2255,21 +2372,68 @@ class AgenticSessionShard:
                         event_name="reasoning_started",
                         dispatch_id=dispatch_id,
                     )
-                break
-            mark_agentic_event(generation_profile, "generation_start_at")
-            result = await self.backend.generate(
-                input_ids=input_ids,
-                sampling_params=sampling_params,
-                session_id=session_id,
-                request_id=dispatch_id,
-                image_data=image_data,
-                audio_data=audio_data,
-                video_data=video_data,
-                return_logprob=return_logprob,
-            )
-            lease_outcome = (
-                LeaseReleaseOutcome.REQUEUED if result.finish_type == "abort" else LeaseReleaseOutcome.COMPLETED
-            )
+                mark_agentic_event(generation_profile, "generation_start_at")
+                result, renewed_lease, lease_lost = await self._generate_with_admission_lease(
+                    lease=admission_grant.lease,
+                    dispatch_id=dispatch_id,
+                    generate_kwargs={
+                        "input_ids": input_ids,
+                        "sampling_params": sampling_params,
+                        "session_id": session_id,
+                        "request_id": dispatch_id,
+                        "image_data": image_data,
+                        "audio_data": audio_data,
+                        "video_data": video_data,
+                        "return_logprob": return_logprob,
+                    },
+                )
+                if renewed_lease is not None:
+                    admission_grant = AdmissionGrant(
+                        decision=admission_grant.decision,
+                        lease=renewed_lease,
+                    )
+                if not lease_lost:
+                    lease_outcome = (
+                        LeaseReleaseOutcome.REQUEUED
+                        if result.finish_type == "abort"
+                        else LeaseReleaseOutcome.COMPLETED
+                    )
+                    break
+                lease_outcome = LeaseReleaseOutcome.STALE
+                mark_agentic_event(generation_profile, "generation_end_at")
+                lock = self._get_session_lock(session_id)
+                if lock is None:
+                    return
+                async with lock:
+                    record = self._session_records.get(session_id)
+                    active_ir = (
+                        None
+                        if record is None
+                        else self._active_ir_for_dispatch_locked(
+                            record=record,
+                            ir_id=ir_id,
+                            runner_epoch=runner_epoch,
+                            dispatch_id=dispatch_id,
+                        )
+                    )
+                    if active_ir is None:
+                        return
+                    self._record_dispatch_event_locked(
+                        record=record,
+                        event_name="reasoning_finished",
+                        dispatch_id=dispatch_id,
+                    )
+                    active_ir.backend_started = False
+                if permit_acquired:
+                    await self._release_sglang_request_permit_for_ir()
+                    permit_acquired = False
+                await self._scheduler().release(
+                    lease=admission_grant.lease,
+                    outcome=lease_outcome,
+                )
+                admission_grant = None
+                revalidation_failures += 1
+                await asyncio.sleep(_ADMISSION_REVALIDATE_BACKOFF_S)
         except BackendContextLengthExceededError:
             lease_outcome = LeaseReleaseOutcome.FAILED
             lock = self._get_session_lock(session_id)
@@ -3123,25 +3287,58 @@ def create_agentic_session_shards(config: Namespace):
             ray.kill(ray.get_actor(agentic_session_shard_name(idx)), no_restart=True)
         except ValueError:
             pass
-    shard_handles = []
-    for idx in range(shard_count):
-        shard_name = agentic_session_shard_name(idx)
-        shard_handles.append(
-            AgenticSessionShard.options(
-                num_cpus=0.25,
-                # Spread the shards across nodes. With the default (PACK) scheduling and a
-                # tiny num_cpus, Ray packs all shards onto a single node;
-                scheduling_strategy="SPREAD",
-                name=shard_name,
-                runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
-            ).remote(
-                config,
-                sglang_request_capacity=request_capacity if idx == 0 else None,
-                sglang_request_limiter=shard_handles[0] if idx > 0 else None,
-                shard_index=idx,
-                shard_count=shard_count,
-            )
+    owner_epochs = [secrets.randbits(63) or 1 for _ in range(shard_count)]
+    admission_budget_coordinator = None
+    try:
+        candidate_coordinator = create_admission_budget_coordinator()
+        ray.get(
+            [
+                candidate_coordinator.register_owner.remote(
+                    shard_id=idx,
+                    owner_epoch=owner_epochs[idx],
+                )
+                for idx in range(shard_count)
+            ],
+            timeout=10,
         )
+        admission_budget_coordinator = candidate_coordinator
+    except Exception as exc:
+        logger.warning(
+            "Agentic admission budget coordinator is unavailable; admission will remain disabled: %s",
+            exc,
+        )
+        shutdown_admission_budget_coordinator()
+    shard_handles = []
+    try:
+        for idx in range(shard_count):
+            shard_name = agentic_session_shard_name(idx)
+            shard_handles.append(
+                AgenticSessionShard.options(
+                    num_cpus=0.25,
+                    # Spread the shards across nodes. With the default (PACK) scheduling and a
+                    # tiny num_cpus, Ray packs all shards onto a single node;
+                    scheduling_strategy="SPREAD",
+                    name=shard_name,
+                    runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
+                ).remote(
+                    config,
+                    sglang_request_capacity=request_capacity if idx == 0 else None,
+                    sglang_request_limiter=shard_handles[0] if idx > 0 else None,
+                    admission_budget_coordinator=admission_budget_coordinator,
+                    shard_index=idx,
+                    shard_count=shard_count,
+                    owner_epoch=owner_epochs[idx],
+                )
+            )
+    except Exception:
+        for shard_handle in shard_handles:
+            try:
+                ray.kill(shard_handle, no_restart=True)
+            except Exception:
+                logger.exception("Failed to clean up a partially created agentic session shard.")
+        if admission_budget_coordinator is not None:
+            shutdown_admission_budget_coordinator()
+        raise
     return shard_handles
 
 

@@ -29,6 +29,7 @@ class BudgetAcquireStatus(str, Enum):
     CAPACITY_EXHAUSTED = "capacity_exhausted"
     BYPASS = "bypass"
     UNKNOWN = "unknown"
+    REJECTED = "rejected"
 
 
 class LeaseReleaseOutcome(str, Enum):
@@ -37,6 +38,11 @@ class LeaseReleaseOutcome(str, Enum):
     CANCELLED = "cancelled"
     REQUEUED = "requeued"
     STALE = "stale"
+
+
+class WorkerPressureState(str, Enum):
+    NORMAL = "normal"
+    CRITICAL = "critical"
 
 
 def _require_non_empty(value: str, *, field_name: str) -> None:
@@ -149,6 +155,8 @@ class AdmissionLease:
     # shard's local monotonic clock. Coordinator monotonic timestamps must not
     # be compared across nodes.
     expires_at_local_monotonic: float
+    coordinator_epoch: str | None = None
+    capacity_generation: int = 0
 
     def __post_init__(self) -> None:
         _require_non_negative_int(self.owner_epoch, field_name="owner_epoch")
@@ -170,6 +178,8 @@ class AdmissionLease:
             raise ValueError("expires_at_local_monotonic must be a number")
         if not math.isfinite(self.expires_at_local_monotonic) or self.expires_at_local_monotonic <= 0:
             raise ValueError("expires_at_local_monotonic must be positive")
+        _require_optional_non_empty(self.coordinator_epoch, field_name="coordinator_epoch")
+        _require_non_negative_int(self.capacity_generation, field_name="capacity_generation")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -207,6 +217,55 @@ class AdmissionGrant:
             or self.lease.reservation_tokens != self.decision.reservation_tokens
         ):
             raise ValueError("admission lease does not match its decision")
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkerSnapshot:
+    worker_id: str
+    engine_epoch: str
+    serving_weight_version: str
+    safe_execution_capacity_tokens: int
+    healthy: bool = True
+    pressure_state: WorkerPressureState = WorkerPressureState.NORMAL
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.worker_id, field_name="worker_id")
+        _require_non_empty(self.engine_epoch, field_name="engine_epoch")
+        _require_non_empty(self.serving_weight_version, field_name="serving_weight_version")
+        _require_non_negative_int(
+            self.safe_execution_capacity_tokens,
+            field_name="safe_execution_capacity_tokens",
+        )
+        if not isinstance(self.healthy, bool):
+            raise ValueError("healthy must be a boolean")
+        if not isinstance(self.pressure_state, WorkerPressureState):
+            raise ValueError("pressure_state must be a WorkerPressureState")
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkerSnapshotBatch:
+    source_id: str
+    publisher_epoch: str
+    batch_seq: int
+    source_open: bool
+    complete: bool
+    snapshots: tuple[WorkerSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.source_id, field_name="source_id")
+        _require_non_empty(self.publisher_epoch, field_name="publisher_epoch")
+        _require_non_negative_int(self.batch_seq, field_name="batch_seq")
+        if not isinstance(self.source_open, bool):
+            raise ValueError("source_open must be a boolean")
+        if not isinstance(self.complete, bool):
+            raise ValueError("complete must be a boolean")
+        if not isinstance(self.snapshots, tuple) or not all(
+            isinstance(snapshot, WorkerSnapshot) for snapshot in self.snapshots
+        ):
+            raise ValueError("snapshots must be a tuple of WorkerSnapshot values")
+        worker_ids = {snapshot.worker_id for snapshot in self.snapshots}
+        if len(worker_ids) != len(self.snapshots):
+            raise ValueError("snapshots must not contain duplicate workers")
 
 
 @dataclass(frozen=True, kw_only=True)

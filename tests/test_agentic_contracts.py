@@ -21,6 +21,9 @@ from relax.agentic.session.contracts import (
     BudgetAcquireStatus,
     RouteObservation,
     RoutingContext,
+    WorkerPressureState,
+    WorkerSnapshot,
+    WorkerSnapshotBatch,
 )
 from relax.agentic.session.service import AgenticSessionShard, _SessionRecord
 from relax.agentic.session.state import InflightRequest, RequestKind
@@ -171,6 +174,42 @@ def test_budget_acquire_result_only_carries_lease_when_acquired() -> None:
             status=BudgetAcquireStatus.ACQUIRED,
             reason_code=AdmissionReason.CAPACITY_AVAILABLE,
         )
+
+
+def test_worker_snapshot_batch_requires_unique_workers() -> None:
+    first = WorkerSnapshot(
+        worker_id="worker-1",
+        engine_epoch="epoch-1",
+        serving_weight_version="weight-1",
+        safe_execution_capacity_tokens=100,
+    )
+    with pytest.raises(ValueError, match="duplicate workers"):
+        WorkerSnapshotBatch(
+            source_id="router-1",
+            publisher_epoch="publisher-epoch-1",
+            batch_seq=1,
+            source_open=True,
+            complete=True,
+            snapshots=(
+                first,
+                WorkerSnapshot(
+                    worker_id="worker-1",
+                    engine_epoch="epoch-2",
+                    serving_weight_version="weight-1",
+                    safe_execution_capacity_tokens=100,
+                    pressure_state=WorkerPressureState.CRITICAL,
+                ),
+            ),
+        )
+
+
+def test_worker_snapshot_batch_contains_no_remote_freshness_timestamp() -> None:
+    batch_fields = {item.name for item in fields(WorkerSnapshotBatch)}
+    snapshot_fields = {item.name for item in fields(WorkerSnapshot)}
+    assert "received_at" not in batch_fields
+    assert "monotonic_timestamp" not in batch_fields
+    assert "received_at" not in snapshot_fields
+    assert "monotonic_timestamp" not in snapshot_fields
 
 
 @pytest.mark.parametrize("owner_epoch", [-1, False])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from relax.agentic.session.admission import (
     AdmissionBudgetUnavailableBeforeCommit,
     AdmissionBudgetUnknownCommitOutcome,
+    AdmissionBudgetUnknownRenewalOutcome,
     ProgramScheduler,
 )
 from relax.agentic.session.contracts import (
@@ -57,10 +59,17 @@ class _FakeBudgetPort:
         capacity: int,
         events: list[str] | None = None,
         revalidate_results: list[bool] | None = None,
+        renew_results: list[bool] | None = None,
+        lease_ttl_s: float = 60.0,
     ) -> None:
         self.capacity = capacity
         self.events = events if events is not None else []
         self.revalidate_results = deque(revalidate_results or [True])
+        self.renew_results = deque(renew_results or [True])
+        self.lease_ttl_s = lease_ttl_s
+        self.renew_calls = 0
+        self.renew_exceptions: deque[Exception] = deque()
+        self.availability = 0
         self.active_lease_ids: set[tuple[int, str, str]] = set()
         self.contexts: list[RoutingContext] = []
         self.successful_programs: list[str] = []
@@ -89,8 +98,8 @@ class _FakeBudgetPort:
             dispatch_id=routing_context.dispatch_id,
             admission_decision_id=admission_decision_id,
             reservation_tokens=routing_context.reservation_tokens,
-            ttl_s=60.0,
-            expires_at_local_monotonic=time.monotonic() + 60,
+            ttl_s=self.lease_ttl_s,
+            expires_at_local_monotonic=time.monotonic() + self.lease_ttl_s,
         )
         self.active_lease_ids.add((lease.owner_epoch, lease.dispatch_id, lease.admission_decision_id))
         self.successful_programs.append(routing_context.program_id)
@@ -119,12 +128,9 @@ class _FakeBudgetPort:
                 status=BudgetAcquireStatus.UNKNOWN,
                 reason_code=AdmissionReason.DEGRADED,
             )
-        if (
-            len(self.active_lease_ids) >= self.capacity
-            or (
-                self.max_reservation_tokens is not None
-                and routing_context.reservation_tokens > self.max_reservation_tokens
-            )
+        if len(self.active_lease_ids) >= self.capacity or (
+            self.max_reservation_tokens is not None
+            and routing_context.reservation_tokens > self.max_reservation_tokens
         ):
             return BudgetAcquireResult(
                 status=BudgetAcquireStatus.CAPACITY_EXHAUSTED,
@@ -171,6 +177,37 @@ class _FakeBudgetPort:
             return self.revalidate_results.popleft()
         return self.revalidate_results[0]
 
+    async def activate(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        self.events.append("budget:activate")
+        if len(self.revalidate_results) > 1:
+            valid = self.revalidate_results.popleft()
+        else:
+            valid = self.revalidate_results[0]
+        if not valid:
+            return None
+        return replace(
+            lease,
+            ttl_s=self.lease_ttl_s,
+            expires_at_local_monotonic=time.monotonic() + self.lease_ttl_s,
+        )
+
+    async def renew(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        self.events.append("budget:renew")
+        self.renew_calls += 1
+        if self.renew_exceptions:
+            raise self.renew_exceptions.popleft()
+        if len(self.renew_results) > 1:
+            valid = self.renew_results.popleft()
+        else:
+            valid = self.renew_results[0]
+        if not valid:
+            return None
+        return replace(
+            lease,
+            ttl_s=self.lease_ttl_s,
+            expires_at_local_monotonic=time.monotonic() + self.lease_ttl_s,
+        )
+
     async def release(
         self,
         *,
@@ -186,6 +223,10 @@ class _FakeBudgetPort:
         if self.release_exceptions_after_commit:
             raise self.release_exceptions_after_commit.popleft()
         self.release_outcomes.append(outcome)
+        self.availability += 1
+
+    async def availability_seq(self) -> int:
+        return self.availability
 
 
 @pytest.mark.asyncio
@@ -664,7 +705,7 @@ async def test_shard_admits_before_permit_and_uses_dispatch_identity() -> None:
     assert events == [
         "budget:acquire:normal",
         "permit:acquire",
-        "budget:revalidate",
+        "budget:activate",
         "backend",
         "permit:release",
         "budget:release",
@@ -786,7 +827,7 @@ async def test_shard_bounds_revalidation_retries_then_degrades_to_bypass() -> No
 
     assert len(port.contexts) == 3
     assert len({context.dispatch_id for context in port.contexts}) == 3
-    assert events.count("budget:revalidate") == 3
+    assert events.count("budget:activate") == 3
     assert events.count("backend") == 1
     assert backend_request_ids[0] not in {context.dispatch_id for context in port.contexts}
     assert request.admission_action == AdmissionAction.BYPASS.value
@@ -794,6 +835,122 @@ async def test_shard_bounds_revalidation_retries_then_degrades_to_bypass() -> No
         LeaseReleaseOutcome.STALE,
         LeaseReleaseOutcome.STALE,
         LeaseReleaseOutcome.STALE,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shard_renews_lease_while_backend_is_running() -> None:
+    events: list[str] = []
+    port = _FakeBudgetPort(
+        capacity=1,
+        events=events,
+        lease_ttl_s=0.03,
+    )
+    shard_cls, shard, record, request = _service_shard(port=port, events=events)
+    record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
+
+    async def generate(**kwargs):
+        del kwargs
+        events.append("backend")
+        await asyncio.sleep(0.04)
+        raise RuntimeError("stop after renewal")
+
+    shard.backend = SimpleNamespace(generate=generate)
+
+    await shard_cls._run_ir(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+    )
+
+    assert port.renew_calls >= 1
+    assert events.count("backend") == 1
+    assert port.release_outcomes == [LeaseReleaseOutcome.FAILED]
+
+
+@pytest.mark.asyncio
+async def test_shard_does_not_interrupt_decode_when_renewal_outcome_is_unknown() -> None:
+    events: list[str] = []
+    port = _FakeBudgetPort(
+        capacity=1,
+        events=events,
+        lease_ttl_s=0.03,
+    )
+    port.renew_exceptions.append(AdmissionBudgetUnknownRenewalOutcome("coordinator timeout"))
+    shard_cls, shard, record, request = _service_shard(port=port, events=events)
+    record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
+    backend_request_ids: list[str] = []
+    aborted_request_ids: list[str] = []
+
+    async def generate(**kwargs):
+        backend_request_ids.append(kwargs["request_id"])
+        await asyncio.sleep(0.04)
+        raise RuntimeError("stop after unknown renewal")
+
+    async def abort_backend_request_ids(request_ids):
+        aborted_request_ids.extend(request_ids)
+
+    shard.backend = SimpleNamespace(generate=generate)
+    shard._abort_backend_request_ids = abort_backend_request_ids
+
+    await shard_cls._run_ir(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+    )
+
+    assert len(backend_request_ids) == 1
+    assert aborted_request_ids == []
+    assert port.release_outcomes == [LeaseReleaseOutcome.FAILED]
+
+
+@pytest.mark.asyncio
+async def test_shard_aborts_and_redispatches_when_lease_renewal_is_lost() -> None:
+    events: list[str] = []
+    port = _FakeBudgetPort(
+        capacity=1,
+        events=events,
+        lease_ttl_s=0.03,
+        renew_results=[True, False, True],
+    )
+    shard_cls, shard, record, request = _service_shard(port=port, events=events)
+    record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
+    first_backend_cancelled = asyncio.Event()
+    backend_request_ids: list[str] = []
+    aborted_request_ids: list[str] = []
+
+    async def generate(**kwargs):
+        backend_request_ids.append(kwargs["request_id"])
+        if len(backend_request_ids) == 1:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                first_backend_cancelled.set()
+        raise RuntimeError("stop after redispatch")
+
+    async def abort_backend_request_ids(request_ids):
+        aborted_request_ids.extend(request_ids)
+
+    shard.backend = SimpleNamespace(generate=generate)
+    shard._abort_backend_request_ids = abort_backend_request_ids
+
+    await shard_cls._run_ir(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+    )
+
+    assert first_backend_cancelled.is_set()
+    assert len(backend_request_ids) == 2
+    assert len(set(backend_request_ids)) == 2
+    assert aborted_request_ids == [backend_request_ids[0]]
+    assert len({context.attempt_id for context in port.contexts}) == 1
+    assert port.release_outcomes == [
+        LeaseReleaseOutcome.STALE,
+        LeaseReleaseOutcome.FAILED,
     ]
 
 

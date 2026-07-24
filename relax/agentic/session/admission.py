@@ -35,6 +35,10 @@ class AdmissionBudgetUnknownCommitOutcome(RuntimeError):
     """The budget service may have committed an acquisition before failing."""
 
 
+class AdmissionBudgetUnknownRenewalOutcome(RuntimeError):
+    """An in-flight lease renewal outcome could not be determined."""
+
+
 class AdmissionBudgetPort(Protocol):
     """Shard-side budget port.
 
@@ -66,12 +70,18 @@ class AdmissionBudgetPort(Protocol):
 
     async def revalidate(self, *, lease: AdmissionLease) -> bool: ...
 
+    async def activate(self, *, lease: AdmissionLease) -> AdmissionLease | None: ...
+
+    async def renew(self, *, lease: AdmissionLease) -> AdmissionLease | None: ...
+
     async def release(
         self,
         *,
         lease: AdmissionLease,
         outcome: LeaseReleaseOutcome,
     ) -> None: ...
+
+    async def availability_seq(self) -> int: ...
 
 
 class DisabledAdmissionBudgetPort:
@@ -112,6 +122,14 @@ class DisabledAdmissionBudgetPort:
         del lease
         return False
 
+    async def activate(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        del lease
+        return None
+
+    async def renew(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        del lease
+        return None
+
     async def release(
         self,
         *,
@@ -119,6 +137,9 @@ class DisabledAdmissionBudgetPort:
         outcome: LeaseReleaseOutcome,
     ) -> None:
         del lease, outcome
+
+    async def availability_seq(self) -> int:
+        return 0
 
 
 @dataclass
@@ -180,14 +201,17 @@ class ProgramScheduler:
         budget_port: AdmissionBudgetPort | None = None,
         max_wait_s: float = 30.0,
         protected_max_wait_s: float = 5.0,
+        capacity_poll_s: float = 0.1,
         clock: Callable[[], float] = time.monotonic,
         decision_id_factory: Callable[[], str] | None = None,
     ) -> None:
-        if max_wait_s <= 0 or protected_max_wait_s <= 0:
+        if max_wait_s <= 0 or protected_max_wait_s <= 0 or capacity_poll_s <= 0:
             raise ValueError("admission wait bounds must be positive")
         self._budget_port = budget_port or DisabledAdmissionBudgetPort()
         self._max_wait_s = float(max_wait_s)
         self._protected_max_wait_s = float(protected_max_wait_s)
+        self._capacity_poll_s = float(capacity_poll_s)
+        self._capacity_poll_max_s = max(0.5, self._capacity_poll_s)
         self._clock = clock
         self._decision_id_factory = decision_id_factory or (lambda: f"decision-{secrets.token_hex(16)}")
         self._waiters_by_program: dict[str, deque[_AdmissionWaiter]] = {}
@@ -198,6 +222,8 @@ class ProgramScheduler:
         self._released_lease_keys: set[tuple[int, str, str]] = set()
         self._released_lease_order: deque[tuple[int, str, str]] = deque()
         self._released_lease_limit = 8192
+        self._capacity_watch_task: asyncio.Task[None] | None = None
+        self._last_availability_seq: int | None = None
 
     @staticmethod
     def _decision(
@@ -229,6 +255,27 @@ class ProgramScheduler:
         self._waiters_by_program.setdefault(program_id, deque()).append(waiter)
         self._append_ready_program(program_id)
 
+    def _has_deferred_waiters(self) -> bool:
+        return any(
+            not waiter.cancelled and not waiter.future.done()
+            for waiters in self._waiters_by_program.values()
+            for waiter in waiters
+        )
+
+    def _ensure_capacity_watch(self) -> None:
+        if self._capacity_watch_task is not None and not self._capacity_watch_task.done():
+            return
+        self._capacity_watch_task = asyncio.create_task(self._watch_capacity())
+        self._capacity_watch_task.add_done_callback(self._observe_background_task)
+
+    def _stop_capacity_watch_if_idle(self) -> None:
+        if self._has_deferred_waiters():
+            return
+        task = self._capacity_watch_task
+        self._capacity_watch_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
     def _remove_waiter(self, waiter: _AdmissionWaiter) -> None:
         program_id = waiter.routing_context.program_id
         waiters = self._waiters_by_program.get(program_id)
@@ -243,6 +290,7 @@ class ProgramScheduler:
             self._ready_program_keys.discard(program_id)
             while program_id in self._ready_programs:
                 self._ready_programs.remove(program_id)
+        self._stop_capacity_watch_if_idle()
 
     async def submit(
         self,
@@ -304,6 +352,7 @@ class ProgramScheduler:
                 initial_decision=grant.decision,
                 grant=grant,
             )
+        self._ensure_capacity_watch()
         decision = self._decision(
             action=AdmissionAction.DEFER,
             reason_code=AdmissionReason.CAPACITY_EXHAUSTED,
@@ -338,16 +387,25 @@ class ProgramScheduler:
             raise
 
     async def _resolve_unknown(self, waiter: _AdmissionWaiter) -> BudgetAcquireResult:
-        result = await self._budget_port.reconcile(
-            routing_context=waiter.routing_context,
-            admission_decision_id=waiter.admission_decision_id,
-        )
+        try:
+            result = await self._budget_port.reconcile(
+                routing_context=waiter.routing_context,
+                admission_decision_id=waiter.admission_decision_id,
+            )
+        except AdmissionBudgetUnavailableBeforeCommit:
+            return BudgetAcquireResult(
+                status=BudgetAcquireStatus.BYPASS,
+                reason_code=AdmissionReason.DEGRADED,
+            )
         if result.status != BudgetAcquireStatus.UNKNOWN:
             return result
-        await self._budget_port.cancel_unknown(
-            routing_context=waiter.routing_context,
-            admission_decision_id=waiter.admission_decision_id,
-        )
+        try:
+            await self._budget_port.cancel_unknown(
+                routing_context=waiter.routing_context,
+                admission_decision_id=waiter.admission_decision_id,
+            )
+        except AdmissionBudgetUnavailableBeforeCommit:
+            pass
         return BudgetAcquireResult(
             status=BudgetAcquireStatus.BYPASS,
             reason_code=AdmissionReason.DEGRADED,
@@ -474,6 +532,7 @@ class ProgramScheduler:
                         self._waiters_by_program.pop(program_id, None)
                 if completed_in_round == 0:
                     break
+            self._stop_capacity_watch_if_idle()
 
     async def _force_waiter(self, waiter: _AdmissionWaiter) -> None:
         try:
@@ -530,6 +589,41 @@ class ProgramScheduler:
         if lease.expires_at_local_monotonic <= self._clock():
             return False
         return await self._budget_port.revalidate(lease=lease)
+
+    async def renew(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        if lease.expires_at_local_monotonic <= self._clock():
+            return None
+        return await self._budget_port.renew(lease=lease)
+
+    async def activate(self, *, lease: AdmissionLease) -> AdmissionLease | None:
+        if lease.expires_at_local_monotonic <= self._clock():
+            return None
+        return await self._budget_port.activate(lease=lease)
+
+    async def _watch_capacity(self) -> None:
+        failure_reported = False
+        poll_s = self._capacity_poll_s
+        try:
+            while self._has_deferred_waiters():
+                await asyncio.sleep(poll_s)
+                try:
+                    availability_seq = await self._budget_port.availability_seq()
+                except Exception as exc:
+                    if not failure_reported:
+                        logger.warning("Admission capacity watch is unavailable: %s", exc)
+                        failure_reported = True
+                    poll_s = min(self._capacity_poll_max_s, poll_s * 2.0)
+                    continue
+                failure_reported = False
+                if self._last_availability_seq is None or availability_seq != self._last_availability_seq:
+                    self._last_availability_seq = availability_seq
+                    poll_s = self._capacity_poll_s
+                    await self._pump()
+                else:
+                    poll_s = min(self._capacity_poll_max_s, poll_s * 2.0)
+        finally:
+            if self._capacity_watch_task is asyncio.current_task():
+                self._capacity_watch_task = None
 
     @staticmethod
     def _lease_key(lease: AdmissionLease) -> tuple[int, str, str]:
