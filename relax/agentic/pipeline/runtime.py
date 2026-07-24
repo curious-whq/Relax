@@ -48,6 +48,11 @@ from relax.agentic.session.contracts import (
     SessionControlRef,
     SessionRegistrationGrant,
 )
+from relax.agentic.session.sglang_capabilities import (
+    SGLangCapabilityProfile,
+    SGLangSessionWireFormat,
+    unavailable_sglang_capability_profile,
+)
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     TrainingFieldArtifact,
@@ -3796,7 +3801,13 @@ def _is_context_length_error(exc: httpx.HTTPStatusError) -> bool:
 
 
 class SGLangBackendAdapter:
-    def __init__(self, args: Any, *, compiler_resources: AgenticCompilerResources | None = None):
+    def __init__(
+        self,
+        args: Any,
+        *,
+        compiler_resources: AgenticCompilerResources | None = None,
+        capability_profile: SGLangCapabilityProfile | None = None,
+    ):
         router_port = args.sglang_router_port
         self._resolved_router_ip = args.sglang_router_ip
         self._resolved_router_port = None if router_port is None else int(router_port)
@@ -3804,6 +3815,7 @@ class SGLangBackendAdapter:
         self._use_rollout_routing_replay = args.use_rollout_routing_replay
         self._router_policy = args.sglang_router_policy
         self._slime_router_sticky = getattr(args, "slime_router_sticky", False)
+        self._capability_profile = capability_profile or unavailable_sglang_capability_profile()
         resources = compiler_resources or get_agentic_runtime_resources(args).compiler
         self.tokenizer = resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -3822,6 +3834,7 @@ class SGLangBackendAdapter:
         input_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
+        engine_session_id: str | None = None,
         request_id: str | None = None,
         image_data: list[str] | None = None,
         audio_data: list[str] | None = None,
@@ -3838,6 +3851,19 @@ class SGLangBackendAdapter:
         }
         if request_id:
             payload["request_id"] = request_id
+        if engine_session_id and self._capability_profile.session_wire_enabled:
+            if self._capability_profile.session_wire_format != SGLangSessionWireFormat.SESSION_PARAMS_V1:
+                raise RuntimeError(
+                    f"Unsupported SGLang session wire format: {self._capability_profile.session_wire_format.value}"
+                )
+            # SGLang v0.5.12 exposes the physical session key through the
+            # top-level session_params field. replace=True keeps Relax's
+            # complete replay payload authoritative instead of appending a
+            # provider-owned incremental prompt.
+            payload["session_params"] = {
+                "id": engine_session_id,
+                "replace": True,
+            }
         if self._use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:

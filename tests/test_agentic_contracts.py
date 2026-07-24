@@ -26,6 +26,11 @@ from relax.agentic.session.contracts import (
     WorkerSnapshotBatch,
 )
 from relax.agentic.session.service import AgenticSessionShard, _SessionRecord
+from relax.agentic.session.sglang_capabilities import (
+    SGLangCapabilityProfile,
+    resolve_sglang_capability_profile,
+    unavailable_sglang_capability_profile,
+)
 from relax.agentic.session.state import InflightRequest, RequestKind
 
 
@@ -62,16 +67,33 @@ def _routing_context(**overrides) -> RoutingContext:
     return RoutingContext(**values)
 
 
-def _backend_adapter(*, router_policy: str = "consistent_hashing", slime_router_sticky: bool = False):
+def _backend_adapter(
+    *,
+    router_policy: str = "consistent_hashing",
+    slime_router_sticky: bool = False,
+    capability_profile: SGLangCapabilityProfile | None = None,
+):
     adapter = object.__new__(SGLangBackendAdapter)
     adapter._resolved_router_ip = "router.test"
     adapter._resolved_router_port = 30000
     adapter._use_rollout_routing_replay = False
     adapter._router_policy = router_policy
     adapter._slime_router_sticky = slime_router_sticky
+    adapter._capability_profile = capability_profile or unavailable_sglang_capability_profile()
     adapter.tokenizer = object()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
+
+
+def _ready_session_capability_profile() -> SGLangCapabilityProfile:
+    return resolve_sglang_capability_profile(
+        router_managed=True,
+        use_slime_router=False,
+        has_pd_disaggregation=False,
+        radix_cache_disabled=False,
+        hierarchical_cache_enabled=False,
+        lifecycle_ready=True,
+    )
 
 
 def test_agentic_identity_rejects_missing_internal_id() -> None:
@@ -300,6 +322,7 @@ async def test_sglang_adapter_preserves_complete_replay_and_engine_meta(monkeypa
         input_ids=input_ids,
         sampling_params=sampling_params,
         session_id="logical-session-1",
+        engine_session_id="engine-session-1",
         request_id="request-1",
         image_data=image_data,
         audio_data=audio_data,
@@ -318,10 +341,90 @@ async def test_sglang_adapter_preserves_complete_replay_and_engine_meta(monkeypa
     assert payload["video_data"] == video_data
     assert payload["video_data"] is not video_data
     assert "session_id" not in payload
+    assert "session_params" not in payload
     assert headers == {"X-SMG-Routing-Key": "logical-session-1"}
     assert result.meta_info["cached_tokens"] == 24
     assert result.meta_info["prompt_tokens"] == 32
     assert result.meta_info["weight_version"] == "weight-1"
+
+
+@pytest.mark.asyncio
+async def test_sglang_adapter_serializes_ready_engine_session_separately_from_affinity(monkeypatch) -> None:
+    calls = []
+
+    async def fake_post(url, payload, headers=None):
+        calls.append((url, payload, headers))
+        return {
+            "output_ids": [],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(
+        runtime,
+        "_extract_output_tokens_and_log_probs",
+        lambda *args, **kwargs: ([], []),
+    )
+    adapter = _backend_adapter(capability_profile=_ready_session_capability_profile())
+    input_ids = [11, 12, 13, 14]
+    sampling_params = {"max_new_tokens": 8}
+
+    await adapter.generate(
+        input_ids=input_ids,
+        sampling_params=sampling_params,
+        session_id="affinity-engine-session-1",
+        engine_session_id="engine-session-1",
+        request_id="dispatch-1",
+    )
+
+    _, payload, headers = calls[0]
+    assert payload["input_ids"] == input_ids
+    assert payload["input_ids"] is not input_ids
+    assert payload["sampling_params"] == sampling_params
+    assert payload["sampling_params"] is not sampling_params
+    assert payload["session_params"] == {
+        "id": "engine-session-1",
+        "replace": True,
+    }
+    assert "session_id" not in payload
+    assert "engine_session_id" not in payload
+    assert "session_params" not in payload["sampling_params"]
+    assert headers == {"X-SMG-Routing-Key": "affinity-engine-session-1"}
+
+
+@pytest.mark.asyncio
+async def test_sglang_adapter_does_not_infer_physical_session_from_legacy_affinity(monkeypatch) -> None:
+    calls = []
+
+    async def fake_post(url, payload, headers=None):
+        calls.append((url, payload, headers))
+        return {
+            "output_ids": [],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(
+        runtime,
+        "_extract_output_tokens_and_log_probs",
+        lambda *args, **kwargs: ([], []),
+    )
+    adapter = _backend_adapter(capability_profile=_ready_session_capability_profile())
+
+    await adapter.generate(
+        input_ids=[11, 12],
+        sampling_params={"max_new_tokens": 1},
+        session_id="legacy-logical-session",
+        request_id="dispatch-1",
+    )
+
+    _, payload, headers = calls[0]
+    assert "session_params" not in payload
+    assert headers == {"X-SMG-Routing-Key": "legacy-logical-session"}
 
 
 @pytest.mark.parametrize(
@@ -375,7 +478,17 @@ async def test_sglang_adapter_soft_affinity_header_matrix(
 
 
 @pytest.mark.asyncio
-async def test_session_shard_builds_backend_request_from_complete_replay() -> None:
+@pytest.mark.parametrize(
+    ("identity_session_id", "expected_engine_session_id"),
+    [
+        ("logical-session-1", "logical-session-1"),
+        ("mismatched-session", None),
+    ],
+)
+async def test_session_shard_builds_backend_request_from_complete_replay(
+    identity_session_id: str,
+    expected_engine_session_id: str | None,
+) -> None:
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
     request = InflightRequest(
@@ -392,7 +505,10 @@ async def test_session_shard_builds_backend_request_from_complete_replay() -> No
         pending_rollout_token_delta=[13, 14],
         runner_epoch=1,
     )
-    record = _SessionRecord(scope_id="train")
+    record = _SessionRecord(
+        scope_id="train",
+        identity=_identity(engine_session_id=identity_session_id),
+    )
     record.irs_by_id[request.request_id] = request
     record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
     shard._session_records = {"logical-session-1": record}
@@ -417,6 +533,7 @@ async def test_session_shard_builds_backend_request_from_complete_replay() -> No
     assert calls[0]["image_data"] == ["image-1"]
     assert calls[0]["audio_data"] == ["audio-1"]
     assert calls[0]["video_data"] == ["video-1"]
+    assert calls[0]["engine_session_id"] == expected_engine_session_id
 
 
 def test_session_shard_accumulates_engine_meta_without_route_receipt() -> None:

@@ -25,6 +25,7 @@ from relax.agentic.session.contracts import (
     WorkerSnapshot,
     WorkerSnapshotBatch,
 )
+from relax.agentic.session.sglang_capabilities import resolve_sglang_capability_profile
 from relax.agentic.session.state import RequestKind
 
 
@@ -683,7 +684,7 @@ async def test_session_shard_registers_its_owner_with_injected_coordinator(monke
     monkeypatch.setattr(
         session_service,
         "SGLangBackendAdapter",
-        lambda args, compiler_resources: SimpleNamespace(),
+        lambda args, compiler_resources, capability_profile: SimpleNamespace(),
     )
     shard_cls = session_service.AgenticSessionShard.__ray_metadata__.modified_class
     shard = shard_cls(
@@ -701,6 +702,13 @@ async def test_session_shard_registers_its_owner_with_injected_coordinator(monke
 
 def test_shard_launcher_fails_open_when_coordinator_startup_fails(monkeypatch) -> None:
     remote_calls: list[dict[str, object]] = []
+    capability_profile = resolve_sglang_capability_profile(
+        router_managed=True,
+        use_slime_router=False,
+        has_pd_disaggregation=False,
+        radix_cache_disabled=False,
+        hierarchical_cache_enabled=False,
+    )
 
     class _ShardOptions:
         def remote(self, config, **kwargs):
@@ -730,12 +738,14 @@ def test_shard_launcher_fails_open_when_coordinator_startup_fails(monkeypatch) -
             sglang_server_concurrency=8,
             rollout_num_gpus=2,
             rollout_num_gpus_per_engine=1,
-        )
+        ),
+        sglang_capability_profile=capability_profile,
     )
 
     assert len(handles) == 2
     assert len(remote_calls) == 2
     assert all(call["admission_budget_coordinator"] is None for call in remote_calls)
+    assert all(call["sglang_capability_profile"] is capability_profile for call in remote_calls)
     assert all(call["owner_epoch"] > 0 for call in remote_calls)
 
 

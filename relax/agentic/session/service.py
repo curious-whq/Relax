@@ -58,6 +58,11 @@ from relax.agentic.session.contracts import (
     RoutingContext,
     SessionControlRef,
 )
+from relax.agentic.session.sglang_capabilities import (
+    SGLangCapabilityProfile,
+    resolve_sglang_capability_profile,
+    unavailable_sglang_capability_profile,
+)
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
@@ -101,10 +106,26 @@ def deploy_agentic_chat_api_services(*, config, runtime_env) -> None:
 
     resolved_config = _resolve_sglang_config(config)
     has_pd = resolved_config.has_pd_disaggregation
+    sglang_capability_profile = resolve_sglang_capability_profile(
+        router_managed=config.sglang_router_ip is None,
+        use_slime_router=bool(getattr(config, "use_slime_router", False)),
+        has_pd_disaggregation=has_pd,
+        radix_cache_disabled=bool(getattr(config, "sglang_disable_radix_cache", False)),
+        hierarchical_cache_enabled=bool(
+            getattr(config, "sglang_enable_hierarchical_cache", False)
+            or getattr(config, "sglang_enable_hisparse", False)
+        ),
+        # Session control cannot be activated until Phase 5 supplies bounded
+        # open/close fan-out and close tombstones.
+        lifecycle_ready=False,
+    )
     router_ip, router_port = _start_router(config, has_pd_disaggregation=has_pd, force_new=False)
     config.sglang_router_ip = router_ip
     config.sglang_router_port = router_port
-    session_shards = create_agentic_session_shards(config=config)
+    session_shards = create_agentic_session_shards(
+        config=config,
+        sglang_capability_profile=sglang_capability_profile,
+    )
     chat_deployment = AgenticChatAPIService.options(
         ray_actor_options={"runtime_env": runtime_env},
         num_replicas=_DEFAULT_SESSION_SHARD_COUNT,
@@ -757,6 +778,7 @@ class AgenticSessionShard:
         sglang_request_capacity: int | None = None,
         sglang_request_limiter: Any | None = None,
         admission_budget_coordinator: Any | None = None,
+        sglang_capability_profile: SGLangCapabilityProfile | None = None,
         shard_index: int = 0,
         shard_count: int = 1,
         owner_epoch: int | None = None,
@@ -767,7 +789,11 @@ class AgenticSessionShard:
             self.args = Namespace(**dict(config_payload or {}))
         init_http_client(self.args)
         resources = get_agentic_runtime_resources(self.args)
-        self.backend = SGLangBackendAdapter(self.args, compiler_resources=resources.compiler)
+        self.backend = SGLangBackendAdapter(
+            self.args,
+            compiler_resources=resources.compiler,
+            capability_profile=sglang_capability_profile or unavailable_sglang_capability_profile(),
+        )
         self._shard_index = int(shard_index)
         self._shard_count = int(shard_count)
         self._owner_epoch = int(owner_epoch) if owner_epoch is not None else (secrets.randbits(63) or 1)
@@ -2367,6 +2393,12 @@ class AgenticSessionShard:
                     image_data = ir.history_backend_image_data
                     audio_data = ir.history_backend_audio_data
                     video_data = ir.history_backend_video_data
+                    identity = getattr(record, "identity", None)
+                    engine_session_id = (
+                        identity.engine_session_id
+                        if identity is not None and identity.engine_session_id == session_id
+                        else None
+                    )
                     self._record_dispatch_event_locked(
                         record=record,
                         event_name="reasoning_started",
@@ -2380,6 +2412,7 @@ class AgenticSessionShard:
                         "input_ids": input_ids,
                         "sampling_params": sampling_params,
                         "session_id": session_id,
+                        "engine_session_id": engine_session_id,
                         "request_id": dispatch_id,
                         "image_data": image_data,
                         "audio_data": audio_data,
@@ -3279,7 +3312,11 @@ class AgenticSessionShard:
         )
 
 
-def create_agentic_session_shards(config: Namespace):
+def create_agentic_session_shards(
+    config: Namespace,
+    *,
+    sglang_capability_profile: SGLangCapabilityProfile | None = None,
+):
     shard_count = _DEFAULT_SESSION_SHARD_COUNT
     request_capacity = config.sglang_server_concurrency * config.rollout_num_gpus // config.rollout_num_gpus_per_engine
     for idx in range(max(shard_count, _STALE_SESSION_SHARD_CLEANUP_LIMIT)):
@@ -3325,6 +3362,7 @@ def create_agentic_session_shards(config: Namespace):
                     sglang_request_capacity=request_capacity if idx == 0 else None,
                     sglang_request_limiter=shard_handles[0] if idx > 0 else None,
                     admission_budget_coordinator=admission_budget_coordinator,
+                    sglang_capability_profile=sglang_capability_profile,
                     shard_index=idx,
                     shard_count=shard_count,
                     owner_epoch=owner_epochs[idx],
