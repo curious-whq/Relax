@@ -685,12 +685,16 @@ async def test_shard_admits_before_permit_and_uses_dispatch_identity() -> None:
     events: list[str] = []
     port = _FakeBudgetPort(capacity=1, events=events)
     shard_cls, shard, record, request = _service_shard(port=port, events=events)
+    shard._serving_weight_version = "weight-1"
+    shard._snapshot_received_at = time.monotonic()
     record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
     backend_request_ids: list[str] = []
+    expected_weight_versions: list[str | None] = []
 
     async def generate(**kwargs):
         events.append("backend")
         backend_request_ids.append(kwargs["request_id"])
+        expected_weight_versions.append(kwargs["expected_serving_weight_version"])
         raise RuntimeError("stop after capture")
 
     shard.backend = SimpleNamespace(generate=generate)
@@ -715,6 +719,8 @@ async def test_shard_admits_before_permit_and_uses_dispatch_identity() -> None:
     assert port.contexts[0].dispatch_id == backend_request_ids[0]
     assert port.contexts[0].prompt_tokens == 3
     assert port.contexts[0].expected_decode_tokens == 8
+    assert port.contexts[0].serving_weight_version == "weight-1"
+    assert expected_weight_versions == ["weight-1"]
     assert port.release_outcomes == [LeaseReleaseOutcome.FAILED]
 
 
@@ -808,12 +814,16 @@ async def test_shard_bounds_revalidation_retries_then_degrades_to_bypass() -> No
         revalidate_results=[False],
     )
     shard_cls, shard, record, request = _service_shard(port=port, events=events)
+    shard._serving_weight_version = "weight-1"
+    shard._snapshot_received_at = time.monotonic()
     record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
     backend_request_ids: list[str] = []
+    expected_weight_versions: list[str | None] = []
 
     async def generate(**kwargs):
         events.append("backend")
         backend_request_ids.append(kwargs["request_id"])
+        expected_weight_versions.append(kwargs["expected_serving_weight_version"])
         raise RuntimeError("stop after bounded retries")
 
     shard.backend = SimpleNamespace(generate=generate)
@@ -830,6 +840,7 @@ async def test_shard_bounds_revalidation_retries_then_degrades_to_bypass() -> No
     assert events.count("budget:activate") == 3
     assert events.count("backend") == 1
     assert backend_request_ids[0] not in {context.dispatch_id for context in port.contexts}
+    assert expected_weight_versions == [None]
     assert request.admission_action == AdmissionAction.BYPASS.value
     assert port.release_outcomes == [
         LeaseReleaseOutcome.STALE,

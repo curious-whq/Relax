@@ -3387,6 +3387,10 @@ class BackendContextLengthExceededError(RuntimeError):
     pass
 
 
+class BackendServingWeightVersionMismatchError(RuntimeError):
+    pass
+
+
 class SGLangMessageCompiler:
     def __init__(
         self,
@@ -3840,6 +3844,7 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        expected_serving_weight_version: str | None = None,
     ) -> BackendGenerateResult:
         router_ip, router_port = self._resolved_router_ip, self._resolved_router_port
         if not router_ip or not router_port:
@@ -3887,6 +3892,16 @@ class SGLangBackendAdapter:
             raise
         elapsed = time.time() - started
         meta_info = dict(output.get("meta_info", {}))
+        actual_weight_version = meta_info.get("weight_version")
+        if (
+            expected_serving_weight_version is not None
+            and actual_weight_version is not None
+            and str(actual_weight_version) != expected_serving_weight_version
+        ):
+            raise BackendServingWeightVersionMismatchError(
+                "SGLang serving weight version mismatch: "
+                f"expected={expected_serving_weight_version}, actual={actual_weight_version}"
+            )
         new_tokens, new_log_probs = _extract_output_tokens_and_log_probs(
             meta_info,
             output_ids=output["output_ids"],

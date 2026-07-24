@@ -82,6 +82,12 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.agentic.session.worker_snapshot import (
+    WORKER_SNAPSHOT_TTL_S,
+    create_worker_snapshot_publisher,
+    shutdown_worker_snapshot_publisher,
+    worker_snapshot_capability_enabled,
+)
 from relax.utils.http_utils import get, init_http_client, post
 from relax.utils.logging_utils import get_logger
 
@@ -142,6 +148,7 @@ def deploy_agentic_chat_api_services(*, config, runtime_env) -> None:
 
 
 def shutdown_agentic_chat_api_services() -> None:
+    shutdown_worker_snapshot_publisher()
     try:
         serve.delete(AGENTIC_CHAT_API_SERVICE_NAME)
     except Exception:
@@ -842,6 +849,14 @@ class AgenticSessionShard:
             else RayAdmissionBudgetPort(coordinator=admission_budget_coordinator)
         )
         self._program_scheduler = ProgramScheduler(budget_port=self._admission_budget_port)
+        self._snapshot_coordinator_epoch: str | None = None
+        self._retired_snapshot_coordinator_epochs: set[str] = set()
+        self._snapshot_capacity_generation = -1
+        self._snapshot_source_id: str | None = None
+        self._snapshot_publisher_epoch: str | None = None
+        self._snapshot_batch_seq = -1
+        self._serving_weight_version: str | None = None
+        self._snapshot_received_at: float | None = None
         self._permit_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._evaluating = 0
         self._terminal_ir_gate_closed = False
@@ -857,6 +872,97 @@ class AgenticSessionShard:
             shard_id=self._shard_index,
             owner_epoch=self._owner_epoch,
         )
+
+    async def fence_worker_snapshot_source(
+        self,
+        *,
+        coordinator_epoch: str,
+        capacity_generation: int,
+        source_id: str,
+        publisher_epoch: str,
+    ) -> bool:
+        if not all(isinstance(value, str) and value for value in (coordinator_epoch, source_id, publisher_epoch)):
+            raise ValueError("worker snapshot fence fields must be non-empty")
+        if (
+            not isinstance(capacity_generation, int)
+            or isinstance(capacity_generation, bool)
+            or capacity_generation < 0
+        ):
+            raise ValueError("capacity_generation must be non-negative")
+        if coordinator_epoch in self._retired_snapshot_coordinator_epochs:
+            return False
+        current_coordinator_epoch = self._snapshot_coordinator_epoch
+        if current_coordinator_epoch == coordinator_epoch:
+            if capacity_generation < self._snapshot_capacity_generation:
+                return False
+        elif current_coordinator_epoch is not None:
+            self._retired_snapshot_coordinator_epochs.add(current_coordinator_epoch)
+        self._snapshot_coordinator_epoch = coordinator_epoch
+        self._snapshot_capacity_generation = capacity_generation
+        self._snapshot_source_id = source_id
+        self._snapshot_publisher_epoch = publisher_epoch
+        self._snapshot_batch_seq = -1
+        self._serving_weight_version = None
+        self._snapshot_received_at = None
+        await self._scheduler().notify_capacity_changed()
+        return True
+
+    async def accept_worker_snapshot_version(
+        self,
+        *,
+        coordinator_epoch: str,
+        capacity_generation: int,
+        source_id: str,
+        publisher_epoch: str,
+        batch_seq: int,
+        serving_weight_version: str | None,
+        source_open: bool,
+        complete: bool,
+    ) -> bool:
+        if (
+            not isinstance(capacity_generation, int)
+            or isinstance(capacity_generation, bool)
+            or capacity_generation < 0
+            or not isinstance(batch_seq, int)
+            or isinstance(batch_seq, bool)
+            or batch_seq < 0
+        ):
+            raise ValueError("worker snapshot sequence fields must be non-negative")
+        if not isinstance(source_open, bool) or not isinstance(complete, bool):
+            raise ValueError("worker snapshot state fields must be booleans")
+        if serving_weight_version is not None and (
+            not isinstance(serving_weight_version, str) or not serving_weight_version
+        ):
+            raise ValueError("serving_weight_version must be a non-empty string or None")
+        if (
+            coordinator_epoch != self._snapshot_coordinator_epoch
+            or source_id != self._snapshot_source_id
+            or publisher_epoch != self._snapshot_publisher_epoch
+            or capacity_generation < self._snapshot_capacity_generation
+            or batch_seq <= self._snapshot_batch_seq
+        ):
+            return False
+        self._snapshot_capacity_generation = capacity_generation
+        self._snapshot_batch_seq = batch_seq
+        self._serving_weight_version = (
+            serving_weight_version
+            if source_open and complete and isinstance(serving_weight_version, str) and serving_weight_version
+            else None
+        )
+        self._snapshot_received_at = time.monotonic()
+        await self._scheduler().notify_capacity_changed()
+        return True
+
+    def _active_serving_weight_version(self) -> str | None:
+        serving_weight_version = getattr(self, "_serving_weight_version", None)
+        snapshot_received_at = getattr(self, "_snapshot_received_at", None)
+        if (
+            serving_weight_version is None
+            or snapshot_received_at is None
+            or time.monotonic() - snapshot_received_at > WORKER_SNAPSHOT_TTL_S
+        ):
+            return None
+        return serving_weight_version
 
     def _ensure_session_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -2111,7 +2217,7 @@ class AgenticSessionShard:
             parent_engine_session_id=identity.parent_engine_session_id,
             attempt_id=ir.attempt_id,
             context_version_id=ir.parent_state_hash,
-            serving_weight_version=None,
+            serving_weight_version=self._active_serving_weight_version(),
             prompt_tokens=prompt_tokens,
             expected_decode_tokens=expected_decode_tokens,
             priority=_ADMISSION_PRIORITY_BY_REQUEST_KIND[ir.kind],
@@ -2537,6 +2643,9 @@ class AgenticSessionShard:
                         "audio_data": audio_data,
                         "video_data": video_data,
                         "return_logprob": return_logprob,
+                        "expected_serving_weight_version": (
+                            routing_context.serving_weight_version if admission_grant.lease is not None else None
+                        ),
                     },
                 )
                 if renewed_lease is not None:
@@ -3554,6 +3663,7 @@ def create_agentic_session_shards(
 ):
     shard_count = _DEFAULT_SESSION_SHARD_COUNT
     request_capacity = config.sglang_server_concurrency * config.rollout_num_gpus // config.rollout_num_gpus_per_engine
+    shutdown_worker_snapshot_publisher()
     for idx in range(max(shard_count, _STALE_SESSION_SHARD_CLEANUP_LIMIT)):
         try:
             ray.kill(ray.get_actor(agentic_session_shard_name(idx)), no_restart=True)
@@ -3562,18 +3672,7 @@ def create_agentic_session_shards(
     owner_epochs = [secrets.randbits(63) or 1 for _ in range(shard_count)]
     admission_budget_coordinator = None
     try:
-        candidate_coordinator = create_admission_budget_coordinator()
-        ray.get(
-            [
-                candidate_coordinator.register_owner.remote(
-                    shard_id=idx,
-                    owner_epoch=owner_epochs[idx],
-                )
-                for idx in range(shard_count)
-            ],
-            timeout=10,
-        )
-        admission_budget_coordinator = candidate_coordinator
+        admission_budget_coordinator = create_admission_budget_coordinator()
     except Exception as exc:
         logger.warning(
             "Agentic admission budget coordinator is unavailable; admission will remain disabled: %s",
@@ -3603,6 +3702,11 @@ def create_agentic_session_shards(
                     owner_epoch=owner_epochs[idx],
                 )
             )
+        if admission_budget_coordinator is not None:
+            ray.get(
+                [shard_handle.register_admission_budget_owner.remote() for shard_handle in shard_handles],
+                timeout=10,
+            )
     except Exception:
         for shard_handle in shard_handles:
             try:
@@ -3612,6 +3716,24 @@ def create_agentic_session_shards(
         if admission_budget_coordinator is not None:
             shutdown_admission_budget_coordinator()
         raise
+    if (
+        admission_budget_coordinator is not None
+        and sglang_capability_profile is not None
+        and worker_snapshot_capability_enabled(sglang_capability_profile)
+    ):
+        try:
+            create_worker_snapshot_publisher(
+                router_ip=config.sglang_router_ip,
+                router_port=config.sglang_router_port,
+                coordinator=admission_budget_coordinator,
+                shards=shard_handles,
+            )
+        except Exception as exc:
+            shutdown_worker_snapshot_publisher()
+            logger.warning(
+                "Worker snapshot publisher is unavailable; admission will remain disabled: %s",
+                exc,
+            )
     return shard_handles
 
 

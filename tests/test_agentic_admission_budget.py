@@ -168,6 +168,18 @@ def test_coordinator_fails_open_without_complete_fresh_versioned_snapshot() -> N
     assert missing_version.status == BudgetAcquireStatus.BYPASS
 
 
+def test_coordinator_snapshot_expiry_notifies_deferred_capacity_watch_once() -> None:
+    clock = _Clock()
+    core = _core(clock=clock, snapshot_ttl_s=2.0)
+    core.replace_worker_snapshots(batch=_snapshot_batch())
+    before_expiry = core.availability_seq()
+
+    clock.advance(2.1)
+
+    assert core.availability_seq() == before_expiry + 1
+    assert core.availability_seq() == before_expiry + 1
+
+
 def test_coordinator_atomically_bounds_shared_capacity_and_deduplicates_acquire() -> None:
     clock = _Clock()
     core = _core(

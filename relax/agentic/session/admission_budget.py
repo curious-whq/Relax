@@ -105,6 +105,7 @@ class AdmissionBudgetCoordinatorCore:
         self._tombstone_ttl_s = float(tombstone_ttl_s or max(60.0, lease_ttl_s * 2.0))
         self._snapshot_batch: WorkerSnapshotBatch | None = None
         self._snapshot_received_at: float | None = None
+        self._snapshot_stale_observed = False
         self._snapshot_source_fence: tuple[str, str] | None = None
         self._capacity_generation = 0
         self._availability_seq = 0
@@ -199,10 +200,12 @@ class AdmissionBudgetCoordinatorCore:
             ):
                 self._snapshot_batch = batch
                 self._snapshot_received_at = self._clock()
+                self._snapshot_stale_observed = False
                 return self._capacity_generation
         self._snapshot_batch = batch
         self._snapshot_source_fence = next_source
         self._snapshot_received_at = self._clock()
+        self._snapshot_stale_observed = False
         self._capacity_generation += 1
         self._availability_seq += 1
         revoked_keys = [key for key, lease in self._leases_by_key.items() if not lease.activated]
@@ -216,6 +219,7 @@ class AdmissionBudgetCoordinatorCore:
         self._snapshot_source_fence = (source_id, publisher_epoch)
         self._snapshot_batch = None
         self._snapshot_received_at = None
+        self._snapshot_stale_observed = False
         self._capacity_generation += 1
         self._availability_seq += 1
         revoked_keys = [key for key, lease in self._leases_by_key.items() if not lease.activated]
@@ -225,6 +229,16 @@ class AdmissionBudgetCoordinatorCore:
 
     def _owner_is_active(self, owner_epoch: int) -> bool:
         return owner_epoch in self._owner_epoch_by_shard.values()
+
+    def _observe_snapshot_staleness(self) -> None:
+        if (
+            self._snapshot_batch is not None
+            and self._snapshot_received_at is not None
+            and not self._snapshot_stale_observed
+            and self._clock() - self._snapshot_received_at > self._snapshot_ttl_s
+        ):
+            self._snapshot_stale_observed = True
+            self._availability_seq += 1
 
     @staticmethod
     def _key(
@@ -243,6 +257,7 @@ class AdmissionBudgetCoordinatorCore:
         *,
         serving_weight_version: str | None,
     ) -> tuple[int, int, bool] | None:
+        self._observe_snapshot_staleness()
         if serving_weight_version is None:
             return None
         batch = self._snapshot_batch
@@ -546,6 +561,7 @@ class AdmissionBudgetCoordinatorCore:
 
     def availability_seq(self) -> int:
         self._sweep_expired()
+        self._observe_snapshot_staleness()
         return self._availability_seq
 
     def snapshot(self) -> dict[str, object]:
