@@ -18,6 +18,7 @@ from relax.agentic.session.contracts import (
     BudgetAcquireResult,
     BudgetAcquireStatus,
     LeaseReleaseOutcome,
+    RouteObservation,
     RoutingContext,
 )
 from relax.agentic.session.state import RequestKind
@@ -83,6 +84,24 @@ class AdmissionBudgetPort(Protocol):
 
     async def availability_seq(self) -> int: ...
 
+    async def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool: ...
+
+    async def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool: ...
+
 
 class DisabledAdmissionBudgetPort:
     async def try_acquire(
@@ -140,6 +159,28 @@ class DisabledAdmissionBudgetPort:
 
     async def availability_seq(self) -> int:
         return 0
+
+    async def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool:
+        del routing_context, observation, completion_tokens, event_seq, capacity_generation
+        return False
+
+    async def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool:
+        del owner_epoch, engine_session_id, event_seq
+        return False
 
 
 @dataclass
@@ -688,6 +729,36 @@ class ProgramScheduler:
 
     async def notify_capacity_changed(self) -> None:
         await asyncio.shield(self._pump())
+
+    async def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool:
+        return await self._budget_port.record_route_observation(
+            routing_context=routing_context,
+            observation=observation,
+            completion_tokens=completion_tokens,
+            event_seq=event_seq,
+            capacity_generation=capacity_generation,
+        )
+
+    async def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool:
+        return await self._budget_port.invalidate_resident_context(
+            owner_epoch=owner_epoch,
+            engine_session_id=engine_session_id,
+            event_seq=event_seq,
+        )
 
     def snapshot(self) -> dict[str, int]:
         deferred = sum(

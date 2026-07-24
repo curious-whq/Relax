@@ -46,6 +46,25 @@ def _workers(*urls: str):
 
 
 @pytest.mark.asyncio
+async def test_worker_registry_id_fences_missing_engine_epoch() -> None:
+    async def fake_get(url):
+        assert url.endswith("/workers")
+        return _workers("http://worker-1")
+
+    port = SGLangSessionControlPort(
+        router_ip="router",
+        router_port=30000,
+        capability_profile=_ready_profile(),
+        get_fn=fake_get,
+    )
+
+    targets = await port.worker_targets(include_unhealthy=True)
+
+    assert targets[0].worker_id == "worker-0"
+    assert targets[0].engine_epoch == "worker-0"
+
+
+@pytest.mark.asyncio
 async def test_session_control_open_fans_out_and_partial_failure_fails_open() -> None:
     calls: list[tuple[str, dict]] = []
 

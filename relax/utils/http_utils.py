@@ -7,6 +7,8 @@ import multiprocessing
 import os
 import random
 import socket
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -17,6 +19,12 @@ logger = get_logger(__name__)
 
 SLIME_HOST_IP_ENV = "SLIME_HOST_IP"
 MAX_RETRIES = 6
+
+
+@dataclass(frozen=True, kw_only=True)
+class HttpPostResult:
+    body: Any
+    headers: dict[str, str]
 
 
 def find_available_port(base_port: int):
@@ -167,7 +175,7 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
+async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, return_response_headers=False):
     retry_count = 0
     while retry_count < max_retries:
         response = None
@@ -179,6 +187,7 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
                 output = json.loads(content)
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
+            response_headers = dict(response.headers) if return_response_headers else {}
         except Exception as e:
             retry_count += 1
 
@@ -208,6 +217,8 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
                 await response.aclose()
         break
 
+    if return_response_headers:
+        return HttpPostResult(body=output, headers=response_headers)
     return output
 
 
@@ -259,8 +270,22 @@ def _init_ray_distributed_post(args):
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=MAX_RETRIES, headers=None):
-            return await _post(self._client, url, payload, max_retries, headers=headers)
+        async def do_post(
+            self,
+            url,
+            payload,
+            max_retries=MAX_RETRIES,
+            headers=None,
+            return_response_headers=False,
+        ):
+            return await _post(
+                self._client,
+                url,
+                payload,
+                max_retries,
+                headers=headers,
+                return_response_headers=return_response_headers,
+            )
 
     # Create actors per node
     created = []
@@ -303,6 +328,33 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
             # fall through to local
 
     return await _post(_http_client, url, payload, max_retries, headers=headers)
+
+
+async def post_with_response_headers(url, payload, max_retries=MAX_RETRIES, headers=None) -> HttpPostResult:
+    if _distributed_post_enabled and _post_actors:
+        try:
+            actor = _next_actor()
+            if actor is not None:
+                obj_ref = actor.do_post.remote(
+                    url,
+                    payload,
+                    max_retries,
+                    headers=headers,
+                    return_response_headers=True,
+                )
+                return await obj_ref
+        except Exception as exc:
+            logger.info(
+                f"[http_utils] Distributed POST with response headers failed, falling back to local: {exc} (url={url})"
+            )
+    return await _post(
+        _http_client,
+        url,
+        payload,
+        max_retries,
+        headers=headers,
+        return_response_headers=True,
+    )
 
 
 async def get(url):

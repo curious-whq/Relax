@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from relax.agentic.pipeline.runtime import BackendGenerateResult, BackendRouteReceipt
 from relax.agentic.session.admission import (
     AdmissionBudgetUnavailableBeforeCommit,
     AdmissionBudgetUnknownCommitOutcome,
@@ -28,6 +29,7 @@ from relax.agentic.session.contracts import (
     SessionControlRef,
 )
 from relax.agentic.session.service import AgenticSessionShard, _ProgramRecord, _SessionRecord
+from relax.agentic.session.sglang_lifecycle import SGLangWorkerTarget
 from relax.agentic.session.state import InflightRequest, RequestKind
 
 
@@ -86,6 +88,8 @@ class _FakeBudgetPort:
         self.unblock_release: asyncio.Event | None = None
         self.release_calls = 0
         self.release_exceptions_after_commit: deque[Exception] = deque()
+        self.route_observations = []
+        self.resident_invalidations = []
 
     def _acquired_result(
         self,
@@ -169,6 +173,14 @@ class _FakeBudgetPort:
         self.events.append("budget:cancel_unknown")
         if self.cancel_unknown_error is not None:
             raise self.cancel_unknown_error
+
+    async def record_route_observation(self, **kwargs) -> bool:
+        self.route_observations.append(kwargs)
+        return True
+
+    async def invalidate_resident_context(self, **kwargs) -> bool:
+        self.resident_invalidations.append(kwargs)
+        return True
 
     async def revalidate(self, *, lease: AdmissionLease) -> bool:
         del lease
@@ -678,6 +690,80 @@ def _service_shard(*, port: _FakeBudgetPort, events: list[str]):
         )
     }
     return shard_cls, shard, record, request
+
+
+@pytest.mark.asyncio
+async def test_shard_route_observation_is_dispatch_fenced_and_marks_missing_receipt() -> None:
+    port = _FakeBudgetPort(capacity=1)
+    shard_cls, shard, record, request = _service_shard(port=port, events=[])
+    shard._snapshot_capacity_generation = 3
+    record.lifecycle_targets = (
+        SGLangWorkerTarget(
+            url="http://worker-1",
+            worker_id="worker-1",
+            engine_epoch="engine-epoch-1",
+        ),
+    )
+    request.active_dispatch_id = "dispatch-1"
+    record.active_ir_runner_tasks[request.request_id] = asyncio.current_task()
+    context = _routing_context(
+        request_id=request.request_id,
+        dispatch_id="dispatch-1",
+        context_version_id=request.parent_state_hash,
+    )
+    result = BackendGenerateResult(
+        new_tokens=[21, 22],
+        new_log_probs=[-0.1, -0.2],
+        finish_type="stop",
+        meta_info={
+            "cached_tokens": 2,
+            "prompt_tokens": 3,
+            "weight_version": "weight-1",
+        },
+        elapsed=0.1,
+        route_receipt=BackendRouteReceipt(
+            route_decision_id="route-1",
+            selected_worker_id="worker-1",
+            selected_engine_epoch="engine-epoch-1",
+        ),
+    )
+
+    await shard_cls._record_route_observation(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+        routing_context=context,
+        result=result,
+    )
+
+    assert record.route_history_complete is True
+    assert tuple(record.observed_route_targets) == (("worker-1", "engine-epoch-1"),)
+    assert port.route_observations[0]["observation"].actual_cached_tokens == 2
+    assert port.route_observations[0]["completion_tokens"] == 2
+
+    request.active_dispatch_id = "dispatch-2"
+    await shard_cls._record_route_observation(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+        routing_context=context,
+        result=result,
+    )
+    assert len(port.route_observations) == 1
+
+    missing_receipt_context = replace(context, dispatch_id="dispatch-2")
+    await shard_cls._record_route_observation(
+        shard,
+        session_id="engine-1",
+        ir_id=request.request_id,
+        runner_epoch=1,
+        routing_context=missing_receipt_context,
+        result=replace(result, route_receipt=None),
+    )
+    assert record.route_history_complete is False
+    assert len(port.route_observations) == 2
 
 
 @pytest.mark.asyncio

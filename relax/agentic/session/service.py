@@ -27,6 +27,7 @@ from starlette.requests import ClientDisconnect
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
 from relax.agentic.pipeline.runtime import (
     BackendContextLengthExceededError,
+    BackendServingWeightVersionMismatchError,
     SGLangBackendAdapter,
     agentic_target_session_count_from_args,
     get_agentic_runtime_resources,
@@ -55,6 +56,7 @@ from relax.agentic.session.contracts import (
     AdmissionReason,
     AgenticIdentity,
     LeaseReleaseOutcome,
+    RouteObservation,
     RoutingContext,
     SessionControlRef,
 )
@@ -218,6 +220,8 @@ class _SessionRecord:
     credential_digest: str | None = None
     lifecycle_state: EngineSessionLifecycleState = EngineSessionLifecycleState.BYPASS
     lifecycle_targets: tuple[SGLangWorkerTarget, ...] = ()
+    observed_route_targets: dict[tuple[str, str], SGLangWorkerTarget] = field(default_factory=dict)
+    route_history_complete: bool = True
 
 
 @dataclass
@@ -856,6 +860,7 @@ class AgenticSessionShard:
         self._snapshot_publisher_epoch: str | None = None
         self._snapshot_batch_seq = -1
         self._serving_weight_version: str | None = None
+        self._snapshot_worker_namespace: tuple[tuple[str, str, str], ...] | None = None
         self._snapshot_received_at: float | None = None
         self._permit_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._evaluating = 0
@@ -892,6 +897,7 @@ class AgenticSessionShard:
         if coordinator_epoch in self._retired_snapshot_coordinator_epochs:
             return False
         current_coordinator_epoch = self._snapshot_coordinator_epoch
+        had_snapshot_source = current_coordinator_epoch is not None
         if current_coordinator_epoch == coordinator_epoch:
             if capacity_generation < self._snapshot_capacity_generation:
                 return False
@@ -903,7 +909,11 @@ class AgenticSessionShard:
         self._snapshot_publisher_epoch = publisher_epoch
         self._snapshot_batch_seq = -1
         self._serving_weight_version = None
+        self._snapshot_worker_namespace = None
         self._snapshot_received_at = None
+        if had_snapshot_source:
+            for record in getattr(self, "_session_records", {}).values():
+                record.route_history_complete = False
         await self._scheduler().notify_capacity_changed()
         return True
 
@@ -918,6 +928,7 @@ class AgenticSessionShard:
         serving_weight_version: str | None,
         source_open: bool,
         complete: bool,
+        worker_namespace: tuple[tuple[str, str, str], ...] | None = None,
     ) -> bool:
         if (
             not isinstance(capacity_generation, int)
@@ -934,6 +945,16 @@ class AgenticSessionShard:
             not isinstance(serving_weight_version, str) or not serving_weight_version
         ):
             raise ValueError("serving_weight_version must be a non-empty string or None")
+        if worker_namespace is not None and (
+            not isinstance(worker_namespace, tuple)
+            or any(
+                not isinstance(entry, tuple)
+                or len(entry) != 3
+                or any(not isinstance(value, str) or not value for value in entry)
+                for entry in worker_namespace
+            )
+        ):
+            raise ValueError("worker_namespace must contain non-empty worker incarnation tuples")
         if (
             coordinator_epoch != self._snapshot_coordinator_epoch
             or source_id != self._snapshot_source_id
@@ -942,6 +963,10 @@ class AgenticSessionShard:
             or batch_seq <= self._snapshot_batch_seq
         ):
             return False
+        previous_capacity_generation = self._snapshot_capacity_generation
+        previous_batch_seq = self._snapshot_batch_seq
+        previous_serving_weight_version = self._serving_weight_version
+        previous_worker_namespace = getattr(self, "_snapshot_worker_namespace", None)
         self._snapshot_capacity_generation = capacity_generation
         self._snapshot_batch_seq = batch_seq
         self._serving_weight_version = (
@@ -949,7 +974,29 @@ class AgenticSessionShard:
             if source_open and complete and isinstance(serving_weight_version, str) and serving_weight_version
             else None
         )
+        normalized_worker_namespace = (
+            tuple(sorted(worker_namespace))
+            if source_open and complete and worker_namespace is not None
+            else previous_worker_namespace
+        )
+        self._snapshot_worker_namespace = normalized_worker_namespace
         self._snapshot_received_at = time.monotonic()
+        route_namespace_changed = (
+            previous_serving_weight_version is not None
+            and self._serving_weight_version is not None
+            and self._serving_weight_version != previous_serving_weight_version
+        ) or (
+            previous_worker_namespace is not None
+            and normalized_worker_namespace is not None
+            and normalized_worker_namespace != previous_worker_namespace
+        )
+        if previous_batch_seq >= 0 and (
+            capacity_generation != previous_capacity_generation or route_namespace_changed
+        ):
+            for record in getattr(self, "_session_records", {}).values():
+                record.route_history_complete = False
+                if route_namespace_changed and record.lifecycle_state == EngineSessionLifecycleState.ACTIVE:
+                    record.lifecycle_state = EngineSessionLifecycleState.BYPASS
         await self._scheduler().notify_capacity_changed()
         return True
 
@@ -2274,6 +2321,124 @@ class AgenticSessionShard:
         )
 
     @staticmethod
+    def _non_negative_meta_int(meta_info: dict[str, Any], key: str) -> int | None:
+        value = meta_info.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        return value
+
+    async def _record_route_observation(
+        self,
+        *,
+        session_id: str,
+        ir_id: str,
+        runner_epoch: int,
+        routing_context: RoutingContext | None,
+        result: Any,
+    ) -> None:
+        if routing_context is None:
+            return
+        receipt = getattr(result, "route_receipt", None)
+        observation = RouteObservation(
+            request_id=routing_context.request_id,
+            dispatch_id=routing_context.dispatch_id,
+            owner_epoch=routing_context.owner_epoch,
+            route_decision_id=None if receipt is None else receipt.route_decision_id,
+            selected_worker_id=None if receipt is None else receipt.selected_worker_id,
+            selected_engine_epoch=None if receipt is None else receipt.selected_engine_epoch,
+            serving_weight_version=(
+                str(result.meta_info["weight_version"]) if result.meta_info.get("weight_version") is not None else None
+            ),
+            actual_cached_tokens=self._non_negative_meta_int(result.meta_info, "cached_tokens"),
+            prompt_tokens=self._non_negative_meta_int(result.meta_info, "prompt_tokens"),
+        )
+        lock = self._get_session_lock(session_id)
+        if lock is None:
+            return
+        async with lock:
+            record = self._session_records.get(session_id)
+            if record is None:
+                return
+            ir = self._active_ir_for_dispatch_locked(
+                record=record,
+                ir_id=ir_id,
+                runner_epoch=runner_epoch,
+                dispatch_id=routing_context.dispatch_id,
+            )
+            if ir is None:
+                return
+            identity = record.identity
+            program = None if identity is None else self._program_records.get(identity.program_owner_key)
+            if program is None or program.finalized or program.owner_epoch != observation.owner_epoch:
+                return
+            event_seq = self._record_program_event(
+                program=program,
+                event_id=f"route_observation:{observation.dispatch_id}",
+            )
+            if observation.has_complete_worker_receipt:
+                matching_targets = [
+                    target
+                    for target in record.lifecycle_targets
+                    if target.worker_id == observation.selected_worker_id
+                    and target.engine_epoch == observation.selected_engine_epoch
+                ]
+                if len(matching_targets) == 1:
+                    target = matching_targets[0]
+                    record.observed_route_targets[
+                        (observation.selected_worker_id, observation.selected_engine_epoch)
+                    ] = target
+                else:
+                    record.route_history_complete = False
+            else:
+                record.route_history_complete = False
+            capacity_generation = getattr(self, "_snapshot_capacity_generation", -1)
+        if capacity_generation < 0:
+            return
+        try:
+            await self._scheduler().record_route_observation(
+                routing_context=routing_context,
+                observation=observation,
+                completion_tokens=len(result.new_tokens),
+                event_seq=event_seq,
+                capacity_generation=capacity_generation,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record route observation for dispatch_id=%s",
+                observation.dispatch_id,
+                exc_info=True,
+            )
+
+    async def _invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> None:
+        try:
+            await self._scheduler().invalidate_resident_context(
+                owner_epoch=owner_epoch,
+                engine_session_id=engine_session_id,
+                event_seq=event_seq,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to invalidate resident context for engine_session_id=%s",
+                engine_session_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _close_targets_for_record(record: _SessionRecord) -> tuple[SGLangWorkerTarget, ...]:
+        targets = {
+            (target.url, target.engine_epoch): target
+            for target in (*record.lifecycle_targets, *record.observed_route_targets.values())
+            if target.url
+        }
+        return tuple(sorted(targets.values(), key=lambda target: (target.url, target.engine_epoch or "")))
+
+    @staticmethod
     def _active_ir_for_dispatch_locked(
         *,
         record: _SessionRecord,
@@ -2654,6 +2819,20 @@ class AgenticSessionShard:
                         lease=renewed_lease,
                     )
                 if not lease_lost:
+                    try:
+                        await self._record_route_observation(
+                            session_id=session_id,
+                            ir_id=ir_id,
+                            runner_epoch=runner_epoch,
+                            routing_context=routing_context,
+                            result=result,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Route observation failed for dispatch_id=%s; generation remains successful.",
+                            dispatch_id,
+                            exc_info=True,
+                        )
                     lease_outcome = (
                         LeaseReleaseOutcome.REQUEUED
                         if result.finish_type == "abort"
@@ -2695,6 +2874,57 @@ class AgenticSessionShard:
                 admission_grant = None
                 revalidation_failures += 1
                 await asyncio.sleep(_ADMISSION_REVALIDATE_BACKOFF_S)
+        except BackendServingWeightVersionMismatchError as exc:
+            lease_outcome = LeaseReleaseOutcome.STALE
+            if generation_profile is not None:
+                mark_agentic_event(generation_profile, "generation_end_at")
+            invalidation: tuple[int, str, int] | None = None
+            lock = self._get_session_lock(session_id)
+            if lock is None:
+                return
+            async with lock:
+                record = self._session_records.get(session_id)
+                if record is None:
+                    return
+                ir = (
+                    None
+                    if dispatch_id is None
+                    else self._active_ir_for_dispatch_locked(
+                        record=record,
+                        ir_id=ir_id,
+                        runner_epoch=runner_epoch,
+                        dispatch_id=dispatch_id,
+                    )
+                )
+                if ir is None:
+                    return
+                if ir.backend_started:
+                    self._record_dispatch_event_locked(
+                        record=record,
+                        event_name="reasoning_finished",
+                        dispatch_id=dispatch_id,
+                    )
+                record.route_history_complete = False
+                if record.lifecycle_state == EngineSessionLifecycleState.ACTIVE:
+                    record.lifecycle_state = EngineSessionLifecycleState.BYPASS
+                identity = record.identity
+                program = None if identity is None else self._program_records.get(identity.program_owner_key)
+                if program is not None and program.owner_epoch == self._owner_epoch:
+                    event_seq = self._record_program_event(
+                        program=program,
+                        event_id=f"serving_version_invalidated:{dispatch_id}",
+                    )
+                    invalidation = (program.owner_epoch, identity.engine_session_id, event_seq)
+                self._complete_waiter_locked(record, ir_id, exc=exc)
+                self._release_ir_locked(record, ir_id)
+                self._maybe_start_next_ir_locked(session_id=session_id, record=record)
+            if invalidation is not None:
+                await self._invalidate_resident_context(
+                    owner_epoch=invalidation[0],
+                    engine_session_id=invalidation[1],
+                    event_seq=invalidation[2],
+                )
+            return
         except BackendContextLengthExceededError:
             lease_outcome = LeaseReleaseOutcome.FAILED
             lock = self._get_session_lock(session_id)
@@ -3427,6 +3657,12 @@ class AgenticSessionShard:
                     session_id=session_id,
                     event_id=tombstone.event_id,
                 )
+        if tombstone.event_seq is not None:
+            await self._invalidate_resident_context(
+                owner_epoch=tombstone.owner_epoch,
+                engine_session_id=tombstone.engine_session_id,
+                event_seq=tombstone.event_seq,
+            )
         tombstone.expires_at_monotonic = time.monotonic() + _CLOSE_TOMBSTONE_TTL_S
         if not tombstone.completion.done():
             tombstone.completion.set_result(close_succeeded)
@@ -3586,7 +3822,7 @@ class AgenticSessionShard:
                         control_ref=control_ref,
                         event_id=f"engine_session_finalize:{session_id}",
                         transport=transport,
-                        targets=record.lifecycle_targets,
+                        targets=self._close_targets_for_record(record),
                     )
                     removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
                         session_id=session_id
@@ -3633,7 +3869,7 @@ class AgenticSessionShard:
                             status="discarded",
                             metadata={"discard_reason": "explicit_discard"},
                         ),
-                        targets=record.lifecycle_targets,
+                        targets=self._close_targets_for_record(record),
                     )
                     removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
                         session_id=session_id

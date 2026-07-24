@@ -20,11 +20,11 @@ class _StubClient:
         return self._responses.pop(0)
 
 
-def _response(status_code: int, *, body: str | dict):
+def _response(status_code: int, *, body: str | dict, headers=None):
     request = httpx.Request("POST", "http://test/post")
     if isinstance(body, dict):
-        return httpx.Response(status_code, request=request, json=body)
-    return httpx.Response(status_code, request=request, text=body)
+        return httpx.Response(status_code, request=request, json=body, headers=headers)
+    return httpx.Response(status_code, request=request, text=body, headers=headers)
 
 
 def test_post_does_not_retry_non_retryable_400():
@@ -55,3 +55,27 @@ def test_post_retries_retryable_503_then_succeeds():
 
     assert result == {"ok": True}
     assert client.calls == 2
+
+
+def test_post_can_return_response_headers_without_changing_default_contract():
+    client = _StubClient(
+        [
+            _response(
+                200,
+                body={"ok": True},
+                headers={"X-Relax-Selected-Worker-Id": "worker-1"},
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        _post(
+            client,
+            "http://test/post",
+            {},
+            return_response_headers=True,
+        )
+    )
+
+    assert result.body == {"ok": True}
+    assert result.headers["x-relax-selected-worker-id"] == "worker-1"

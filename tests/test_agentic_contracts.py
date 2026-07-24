@@ -33,6 +33,7 @@ from relax.agentic.session.sglang_capabilities import (
 )
 from relax.agentic.session.sglang_lifecycle import EngineSessionLifecycleState
 from relax.agentic.session.state import InflightRequest, RequestKind
+from relax.utils.http_utils import HttpPostResult
 
 
 def _identity(**overrides) -> AgenticIdentity:
@@ -290,23 +291,46 @@ def test_route_observation_does_not_reject_provider_cache_anomaly() -> None:
     assert observation.actual_cached_tokens == 33
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Relax-Selected-Worker-Id": "worker-1"},
+        {"X-Relax-Selected-Engine-Epoch": "engine-epoch-1"},
+        {
+            "X-Relax-Selected-Worker-Id": "worker-1",
+            "X-Relax-Selected-Engine-Epoch": "",
+        },
+    ],
+)
+def test_sglang_adapter_ignores_missing_or_partial_route_receipt(headers) -> None:
+    assert runtime._sglang_route_receipt(headers) is None
+
+
 @pytest.mark.asyncio
 async def test_sglang_adapter_preserves_complete_replay_and_engine_meta(monkeypatch) -> None:
     calls = []
 
     async def fake_post(url, payload, headers=None):
         calls.append((url, payload, headers))
-        return {
-            "output_ids": [41],
-            "meta_info": {
-                "cached_tokens": 24,
-                "prompt_tokens": 32,
-                "weight_version": "weight-1",
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [41],
+                "meta_info": {
+                    "cached_tokens": 24,
+                    "prompt_tokens": 32,
+                    "weight_version": "weight-1",
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={
+                "X-Relax-Route-Decision-Id": "route-1",
+                "X-Relax-Selected-Worker-Id": "worker-1",
+                "X-Relax-Selected-Engine-Epoch": "engine-epoch-1",
+            },
+        )
 
-    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(runtime, "post_with_response_headers", fake_post)
     monkeypatch.setattr(
         runtime,
         "_extract_output_tokens_and_log_probs",
@@ -347,6 +371,9 @@ async def test_sglang_adapter_preserves_complete_replay_and_engine_meta(monkeypa
     assert result.meta_info["cached_tokens"] == 24
     assert result.meta_info["prompt_tokens"] == 32
     assert result.meta_info["weight_version"] == "weight-1"
+    assert result.route_receipt.route_decision_id == "route-1"
+    assert result.route_receipt.selected_worker_id == "worker-1"
+    assert result.route_receipt.selected_engine_epoch == "engine-epoch-1"
 
 
 @pytest.mark.asyncio
@@ -355,14 +382,17 @@ async def test_sglang_adapter_serializes_ready_engine_session_separately_from_af
 
     async def fake_post(url, payload, headers=None):
         calls.append((url, payload, headers))
-        return {
-            "output_ids": [],
-            "meta_info": {
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [],
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={},
+        )
 
-    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(runtime, "post_with_response_headers", fake_post)
     monkeypatch.setattr(
         runtime,
         "_extract_output_tokens_and_log_probs",
@@ -401,14 +431,17 @@ async def test_sglang_adapter_does_not_infer_physical_session_from_legacy_affini
 
     async def fake_post(url, payload, headers=None):
         calls.append((url, payload, headers))
-        return {
-            "output_ids": [],
-            "meta_info": {
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [],
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={},
+        )
 
-    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(runtime, "post_with_response_headers", fake_post)
     monkeypatch.setattr(
         runtime,
         "_extract_output_tokens_and_log_probs",
@@ -449,14 +482,17 @@ async def test_sglang_adapter_soft_affinity_header_matrix(
 
     async def fake_post(url, payload, headers=None):
         calls.append((url, payload, headers))
-        return {
-            "output_ids": [],
-            "meta_info": {
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [],
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={},
+        )
 
-    monkeypatch.setattr(runtime, "post", fake_post)
+    monkeypatch.setattr(runtime, "post_with_response_headers", fake_post)
     monkeypatch.setattr(
         runtime,
         "_extract_output_tokens_and_log_probs",

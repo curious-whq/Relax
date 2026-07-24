@@ -58,7 +58,7 @@ from relax.agentic.session.state import (
     TrainingFieldArtifact,
     check_messages,
 )
-from relax.utils.http_utils import post
+from relax.utils.http_utils import post_with_response_headers
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.types import Sample
@@ -3374,6 +3374,15 @@ class EncodedMessages:
     timing: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, kw_only=True)
+class BackendRouteReceipt:
+    """Provider-specific receipt normalized before entering session state."""
+
+    route_decision_id: str | None
+    selected_worker_id: str
+    selected_engine_epoch: str
+
+
 @dataclass
 class BackendGenerateResult:
     new_tokens: list[int]
@@ -3381,6 +3390,28 @@ class BackendGenerateResult:
     finish_type: str
     meta_info: dict[str, Any]
     elapsed: float
+    route_receipt: BackendRouteReceipt | None = None
+
+
+_ROUTE_DECISION_HEADER = "x-relax-route-decision-id"
+_SELECTED_WORKER_HEADER = "x-relax-selected-worker-id"
+_SELECTED_ENGINE_EPOCH_HEADER = "x-relax-selected-engine-epoch"
+
+
+def _sglang_route_receipt(response_headers: dict[str, str]) -> BackendRouteReceipt | None:
+    normalized_headers = {key.lower(): value for key, value in response_headers.items()}
+    worker_id = normalized_headers.get(_SELECTED_WORKER_HEADER)
+    engine_epoch = normalized_headers.get(_SELECTED_ENGINE_EPOCH_HEADER)
+    if not all(isinstance(value, str) and value for value in (worker_id, engine_epoch)):
+        return None
+    route_decision_id = normalized_headers.get(_ROUTE_DECISION_HEADER)
+    if route_decision_id is not None and (not isinstance(route_decision_id, str) or not route_decision_id):
+        route_decision_id = None
+    return BackendRouteReceipt(
+        route_decision_id=route_decision_id,
+        selected_worker_id=worker_id,
+        selected_engine_epoch=engine_epoch,
+    )
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -3885,12 +3916,13 @@ class SGLangBackendAdapter:
         url = f"http://{router_ip}:{router_port}/generate"
         started = time.time()
         try:
-            output = await post(url, payload, headers=headers)
+            response = await post_with_response_headers(url, payload, headers=headers)
         except httpx.HTTPStatusError as exc:
             if _is_context_length_error(exc):
                 raise BackendContextLengthExceededError(exc.response.text) from exc
             raise
         elapsed = time.time() - started
+        output = response.body
         meta_info = dict(output.get("meta_info", {}))
         actual_weight_version = meta_info.get("weight_version")
         if (
@@ -3915,4 +3947,5 @@ class SGLangBackendAdapter:
             finish_type=finish_type,
             meta_info=meta_info,
             elapsed=elapsed,
+            route_receipt=_sglang_route_receipt(response.headers),
         )

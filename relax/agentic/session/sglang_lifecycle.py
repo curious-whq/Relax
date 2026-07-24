@@ -129,12 +129,15 @@ class SGLangSessionControlPort:
                     continue
                 healthy = bool(worker.get("is_healthy", False))
                 if include_unhealthy or healthy:
+                    registration_id = str(worker["id"]) if worker.get("id") is not None else None
                     targets.append(
                         SGLangWorkerTarget(
                             url=worker["url"],
-                            worker_id=str(worker["id"]) if worker.get("id") is not None else None,
+                            worker_id=registration_id,
                             engine_epoch=(
-                                str(worker["engine_epoch"]) if worker.get("engine_epoch") is not None else None
+                                str(worker["engine_epoch"])
+                                if worker.get("engine_epoch") is not None
+                                else registration_id
                             ),
                             healthy=healthy,
                         )

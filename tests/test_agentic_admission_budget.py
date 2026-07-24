@@ -20,6 +20,7 @@ from relax.agentic.session.contracts import (
     AdmissionReason,
     BudgetAcquireStatus,
     LeaseReleaseOutcome,
+    RouteObservation,
     RoutingContext,
     WorkerPressureState,
     WorkerSnapshot,
@@ -71,6 +72,8 @@ def _snapshot_batch(
     complete: bool = True,
     healthy: bool = True,
     pressure_state: WorkerPressureState = WorkerPressureState.NORMAL,
+    worker_id: str = "worker-1",
+    engine_epoch: str = "engine-epoch-1",
 ) -> WorkerSnapshotBatch:
     return WorkerSnapshotBatch(
         source_id="router-1",
@@ -80,8 +83,8 @@ def _snapshot_batch(
         complete=complete,
         snapshots=(
             WorkerSnapshot(
-                worker_id="worker-1",
-                engine_epoch="engine-epoch-1",
+                worker_id=worker_id,
+                engine_epoch=engine_epoch,
                 serving_weight_version=version,
                 safe_execution_capacity_tokens=capacity,
                 healthy=healthy,
@@ -89,6 +92,22 @@ def _snapshot_batch(
             ),
         ),
     )
+
+
+def _route_observation(**overrides) -> RouteObservation:
+    values = {
+        "request_id": "request-1",
+        "dispatch_id": "dispatch-1",
+        "owner_epoch": 17,
+        "route_decision_id": "route-1",
+        "selected_worker_id": "worker-1",
+        "selected_engine_epoch": "engine-epoch-1",
+        "serving_weight_version": "weight-1",
+        "actual_cached_tokens": 20,
+        "prompt_tokens": 30,
+    }
+    values.update(overrides)
+    return RouteObservation(**values)
 
 
 def _core(*, clock: _Clock | None = None, **kwargs) -> AdmissionBudgetCoordinatorCore:
@@ -166,6 +185,160 @@ def test_coordinator_fails_open_without_complete_fresh_versioned_snapshot() -> N
         emergency=False,
     )
     assert missing_version.status == BudgetAcquireStatus.BYPASS
+
+
+def test_route_observation_corrects_usage_and_resident_context_survives_lease_release() -> None:
+    clock = _Clock()
+    core = _core(
+        clock=clock,
+        safety_headroom_ratio=0,
+        emergency_reserve_ratio=0,
+    )
+    generation = core.replace_worker_snapshots(batch=_snapshot_batch())
+    context = _routing_context()
+    acquired = core.try_acquire(
+        routing_context=context,
+        admission_decision_id="decision-1",
+        emergency=False,
+    )
+    lease = _lease_from_reply(
+        context=context,
+        decision_id="decision-1",
+        reply=acquired,
+        clock=clock,
+    )
+
+    assert core.record_route_observation(
+        routing_context=context,
+        observation=_route_observation(),
+        completion_tokens=7,
+        event_seq=1,
+        capacity_generation=generation,
+    )
+    core.release(lease=lease, outcome=LeaseReleaseOutcome.COMPLETED)
+
+    snapshot = core.snapshot()
+    assert snapshot["active_leases"] == 0
+    assert snapshot["resident_contexts"] == 1
+    assert snapshot["resident_tokens"] == 37
+
+
+def test_resident_pressure_replaces_same_session_and_guards_other_sessions() -> None:
+    core = _core(
+        safety_headroom_ratio=0,
+        emergency_reserve_ratio=0,
+    )
+    generation = core.replace_worker_snapshots(batch=_snapshot_batch(capacity=100))
+    context = _routing_context(prompt_tokens=60, expected_decode_tokens=10)
+    assert core.record_route_observation(
+        routing_context=context,
+        observation=_route_observation(prompt_tokens=60),
+        completion_tokens=10,
+        event_seq=1,
+        capacity_generation=generation,
+    )
+
+    same_session = core.try_acquire(
+        routing_context=_routing_context(
+            dispatch_id="dispatch-2",
+            context_version_id="context-2",
+            prompt_tokens=70,
+            expected_decode_tokens=10,
+        ),
+        admission_decision_id="decision-same-session",
+        emergency=False,
+    )
+    assert same_session.status == BudgetAcquireStatus.ACQUIRED
+
+    core.cancel_unknown(
+        routing_context=_routing_context(
+            dispatch_id="dispatch-2",
+            context_version_id="context-2",
+            prompt_tokens=70,
+            expected_decode_tokens=10,
+        ),
+        admission_decision_id="decision-same-session",
+    )
+    other_session = core.try_acquire(
+        routing_context=_routing_context(
+            request_id="request-2",
+            dispatch_id="dispatch-3",
+            engine_session_id="engine-2",
+            affinity_key="engine-2",
+            prompt_tokens=30,
+            expected_decode_tokens=10,
+        ),
+        admission_decision_id="decision-other-session",
+        emergency=False,
+    )
+    assert other_session.status == BudgetAcquireStatus.CAPACITY_EXHAUSTED
+    assert other_session.reason_code == AdmissionReason.PRESSURE_GUARD
+
+
+def test_resident_invalidation_fences_late_observation_and_releases_pressure() -> None:
+    core = _core(
+        safety_headroom_ratio=0,
+        emergency_reserve_ratio=0,
+    )
+    generation = core.replace_worker_snapshots(batch=_snapshot_batch(capacity=100))
+    context = _routing_context(prompt_tokens=70, expected_decode_tokens=0)
+    observation = _route_observation(prompt_tokens=70)
+    assert core.record_route_observation(
+        routing_context=context,
+        observation=observation,
+        completion_tokens=0,
+        event_seq=1,
+        capacity_generation=generation,
+    )
+    assert core.invalidate_resident_context(
+        owner_epoch=17,
+        engine_session_id="engine-1",
+        event_seq=2,
+    )
+    assert not core.record_route_observation(
+        routing_context=context,
+        observation=observation,
+        completion_tokens=0,
+        event_seq=1,
+        capacity_generation=generation,
+    )
+    assert core.snapshot()["resident_tokens"] == 0
+
+    admitted = core.try_acquire(
+        routing_context=_routing_context(
+            request_id="request-2",
+            dispatch_id="dispatch-2",
+            engine_session_id="engine-2",
+            affinity_key="engine-2",
+            prompt_tokens=60,
+            expected_decode_tokens=0,
+        ),
+        admission_decision_id="decision-2",
+        emergency=False,
+    )
+    assert admitted.status == BudgetAcquireStatus.ACQUIRED
+
+
+def test_worker_incarnation_change_invalidates_resident_context() -> None:
+    core = _core()
+    generation = core.replace_worker_snapshots(batch=_snapshot_batch(batch_seq=1))
+    assert core.record_route_observation(
+        routing_context=_routing_context(),
+        observation=_route_observation(),
+        completion_tokens=5,
+        event_seq=1,
+        capacity_generation=generation,
+    )
+
+    core.replace_worker_snapshots(
+        batch=_snapshot_batch(
+            batch_seq=2,
+            worker_id="worker-2",
+            engine_epoch="engine-epoch-2",
+        )
+    )
+
+    assert core.snapshot()["resident_contexts"] == 0
 
 
 def test_coordinator_snapshot_expiry_notifies_deferred_capacity_watch_once() -> None:

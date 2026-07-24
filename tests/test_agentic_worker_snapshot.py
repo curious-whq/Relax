@@ -14,7 +14,7 @@ from relax.agentic.pipeline.runtime import (
 )
 from relax.agentic.session import service as session_service
 from relax.agentic.session.contracts import WorkerPressureState
-from relax.agentic.session.service import AgenticSessionShard
+from relax.agentic.session.service import AgenticSessionShard, _SessionRecord
 from relax.agentic.session.sglang_capabilities import (
     resolve_sglang_capability_profile,
     unavailable_sglang_capability_profile,
@@ -28,6 +28,7 @@ from relax.agentic.session.worker_snapshot import (
     parse_worker_registry,
     worker_snapshot_capability_enabled,
 )
+from relax.utils.http_utils import HttpPostResult
 
 
 def _registry(*, version_two_workers: bool = True):
@@ -320,6 +321,15 @@ async def test_publisher_submits_coordinator_before_consensus_to_shards() -> Non
     assert events[0] == "coordinator:replace"
     assert set(events[1:]) == {"shard-0:update", "shard-1:update"}
     assert all(update["serving_weight_version"] == "weight-7" for shard in shards for update in shard.updates)
+    assert all(
+        update["worker_namespace"]
+        == (
+            ("registration-1", "registration-1", "weight-7"),
+            ("registration-2", "registration-2", "weight-7"),
+        )
+        for shard in shards
+        for update in shard.updates
+    )
 
 
 @pytest.mark.asyncio
@@ -356,6 +366,7 @@ async def test_publisher_partial_worker_failure_commits_incomplete_batch() -> No
     assert len(sample.batch.snapshots) == 1
     assert events == ["coordinator:replace", "shard-0:update"]
     assert shard.updates[-1]["complete"] is False
+    assert shard.updates[-1]["worker_namespace"] is None
 
 
 @pytest.mark.asyncio
@@ -471,6 +482,58 @@ def test_shard_snapshot_version_expires_locally() -> None:
     assert shard._active_serving_weight_version() is None
 
 
+@pytest.mark.asyncio
+async def test_shard_worker_incarnation_change_invalidates_route_lease() -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._program_scheduler = _Scheduler()
+    shard._snapshot_coordinator_epoch = None
+    shard._retired_snapshot_coordinator_epochs = set()
+    shard._snapshot_capacity_generation = -1
+    shard._snapshot_source_id = None
+    shard._snapshot_publisher_epoch = None
+    shard._snapshot_batch_seq = -1
+    shard._serving_weight_version = None
+    shard._snapshot_worker_namespace = None
+    shard._snapshot_received_at = None
+    record = _SessionRecord(
+        lifecycle_state=session_service.EngineSessionLifecycleState.ACTIVE,
+    )
+    shard._session_records = {"engine-1": record}
+
+    assert await shard.fence_worker_snapshot_source(
+        coordinator_epoch="coordinator-1",
+        capacity_generation=1,
+        source_id="router",
+        publisher_epoch="publisher-1",
+    )
+    assert await shard.accept_worker_snapshot_version(
+        coordinator_epoch="coordinator-1",
+        capacity_generation=2,
+        source_id="router",
+        publisher_epoch="publisher-1",
+        batch_seq=1,
+        serving_weight_version="weight-1",
+        source_open=True,
+        complete=True,
+        worker_namespace=(("worker-1", "epoch-1", "weight-1"),),
+    )
+    assert await shard.accept_worker_snapshot_version(
+        coordinator_epoch="coordinator-1",
+        capacity_generation=3,
+        source_id="router",
+        publisher_epoch="publisher-1",
+        batch_seq=2,
+        serving_weight_version="weight-1",
+        source_open=True,
+        complete=True,
+        worker_namespace=(("worker-1", "epoch-2", "weight-1"),),
+    )
+
+    assert record.route_history_complete is False
+    assert record.lifecycle_state == session_service.EngineSessionLifecycleState.BYPASS
+
+
 def _backend_adapter() -> SGLangBackendAdapter:
     adapter = object.__new__(SGLangBackendAdapter)
     adapter._resolved_router_ip = "router"
@@ -487,15 +550,18 @@ def _backend_adapter() -> SGLangBackendAdapter:
 @pytest.mark.asyncio
 async def test_backend_rejects_known_serving_weight_version_mismatch(monkeypatch) -> None:
     async def post_generate(*args, **kwargs):
-        return {
-            "output_ids": [1],
-            "meta_info": {
-                "weight_version": "weight-2",
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [1],
+                "meta_info": {
+                    "weight_version": "weight-2",
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={},
+        )
 
-    monkeypatch.setattr(runtime, "post", post_generate)
+    monkeypatch.setattr(runtime, "post_with_response_headers", post_generate)
     monkeypatch.setattr(
         runtime,
         "_extract_output_tokens_and_log_probs",
@@ -526,15 +592,18 @@ async def test_backend_allows_matching_missing_observation_or_bypass(
     expected_version,
 ) -> None:
     async def post_generate(*args, **kwargs):
-        return {
-            "output_ids": [1],
-            "meta_info": {
-                "weight_version": actual_version,
-                "finish_reason": {"type": "stop"},
+        return HttpPostResult(
+            body={
+                "output_ids": [1],
+                "meta_info": {
+                    "weight_version": actual_version,
+                    "finish_reason": {"type": "stop"},
+                },
             },
-        }
+            headers={},
+        )
 
-    monkeypatch.setattr(runtime, "post", post_generate)
+    monkeypatch.setattr(runtime, "post_with_response_headers", post_generate)
     monkeypatch.setattr(runtime, "_extract_output_tokens_and_log_probs", lambda *args, **kwargs: ([1], [0.0]))
     result = await _backend_adapter().generate(
         input_ids=[1],

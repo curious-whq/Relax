@@ -22,6 +22,7 @@ from relax.agentic.session.contracts import (
     BudgetAcquireResult,
     BudgetAcquireStatus,
     LeaseReleaseOutcome,
+    RouteObservation,
     RoutingContext,
     WorkerPressureState,
     WorkerSnapshotBatch,
@@ -66,6 +67,23 @@ class _LeaseRecord:
             self.routing_context.dispatch_id,
             self.admission_decision_id,
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ResidentContextRecord:
+    owner_epoch: int
+    engine_session_id: str
+    serving_weight_version: str
+    context_tokens: int
+    event_seq: int
+    dispatch_id: str
+    selected_worker_id: str | None
+    selected_engine_epoch: str | None
+    actual_cached_tokens: int | None
+
+    @property
+    def key(self) -> tuple[int, str]:
+        return self.owner_epoch, self.engine_session_id
 
 
 class AdmissionBudgetCoordinatorCore:
@@ -115,6 +133,9 @@ class AdmissionBudgetCoordinatorCore:
         self._tombstone_expiry_by_key: dict[tuple[int, str, str], float] = {}
         self._tombstone_expiry_by_dispatch: dict[tuple[int, str], float] = {}
         self._tombstone_order: deque[tuple[float, tuple[int, str, str]]] = deque()
+        self._resident_contexts: dict[tuple[int, str], _ResidentContextRecord] = {}
+        self._resident_event_seq_by_key: dict[tuple[int, str], int] = {}
+        self._resident_event_order: deque[tuple[tuple[int, str], int]] = deque()
 
     @property
     def coordinator_epoch(self) -> str:
@@ -177,7 +198,24 @@ class AdmissionBudgetCoordinatorCore:
         revoked_keys = [key for key in self._leases_by_key if key[0] == previous_epoch]
         for key in revoked_keys:
             self._remove_lease(key)
-        if revoked_keys:
+        resident_keys = [key for key in self._resident_contexts if key[0] == previous_epoch]
+        for key in resident_keys:
+            self._resident_contexts.pop(key, None)
+        if revoked_keys or resident_keys:
+            self._availability_seq += 1
+
+    @staticmethod
+    def _worker_namespace(batch: WorkerSnapshotBatch) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            sorted(
+                (snapshot.worker_id, snapshot.engine_epoch, snapshot.serving_weight_version)
+                for snapshot in batch.snapshots
+            )
+        )
+
+    def _invalidate_all_resident_contexts(self) -> None:
+        if self._resident_contexts:
+            self._resident_contexts.clear()
             self._availability_seq += 1
 
     def replace_worker_snapshots(self, *, batch: WorkerSnapshotBatch) -> int:
@@ -202,6 +240,7 @@ class AdmissionBudgetCoordinatorCore:
                 self._snapshot_received_at = self._clock()
                 self._snapshot_stale_observed = False
                 return self._capacity_generation
+        namespace_changed = current is not None and self._worker_namespace(current) != self._worker_namespace(batch)
         self._snapshot_batch = batch
         self._snapshot_source_fence = next_source
         self._snapshot_received_at = self._clock()
@@ -211,6 +250,8 @@ class AdmissionBudgetCoordinatorCore:
         revoked_keys = [key for key, lease in self._leases_by_key.items() if not lease.activated]
         for key in revoked_keys:
             self._remove_lease(key)
+        if namespace_changed:
+            self._invalidate_all_resident_contexts()
         return self._capacity_generation
 
     def fence_worker_snapshot_source(self, *, source_id: str, publisher_epoch: str) -> int:
@@ -220,6 +261,7 @@ class AdmissionBudgetCoordinatorCore:
         self._snapshot_batch = None
         self._snapshot_received_at = None
         self._snapshot_stale_observed = False
+        self._invalidate_all_resident_contexts()
         self._capacity_generation += 1
         self._availability_seq += 1
         revoked_keys = [key for key, lease in self._leases_by_key.items() if not lease.activated]
@@ -298,6 +340,28 @@ class AdmissionBudgetCoordinatorCore:
             and (emergency is None or lease.emergency == emergency)
         )
 
+    def _projected_resident_tokens(self, *, routing_context: RoutingContext) -> int:
+        serving_weight_version = routing_context.serving_weight_version
+        if serving_weight_version is None:
+            return 0
+        projected_by_session = {
+            record.key: record.context_tokens
+            for record in self._resident_contexts.values()
+            if record.serving_weight_version == serving_weight_version
+        }
+        for lease in self._leases_by_key.values():
+            if lease.routing_context.serving_weight_version == serving_weight_version:
+                projected_by_session[
+                    (
+                        lease.routing_context.owner_epoch,
+                        lease.routing_context.engine_session_id,
+                    )
+                ] = lease.routing_context.reservation_tokens
+        projected_by_session[(routing_context.owner_epoch, routing_context.engine_session_id)] = (
+            routing_context.reservation_tokens
+        )
+        return sum(projected_by_session.values())
+
     def _reply(
         self,
         *,
@@ -375,6 +439,11 @@ class AdmissionBudgetCoordinatorCore:
             )
         hard_ceiling, emergency_reserve, critical_pressure = capacity_view
         if critical_pressure:
+            return self._reply(
+                status=BudgetAcquireStatus.CAPACITY_EXHAUSTED,
+                reason_code=AdmissionReason.PRESSURE_GUARD,
+            )
+        if self._projected_resident_tokens(routing_context=routing_context) > hard_ceiling:
             return self._reply(
                 status=BudgetAcquireStatus.CAPACITY_EXHAUSTED,
                 reason_code=AdmissionReason.PRESSURE_GUARD,
@@ -559,6 +628,87 @@ class AdmissionBudgetCoordinatorCore:
         if released:
             self._availability_seq += 1
 
+    def _remember_resident_event(self, *, key: tuple[int, str], event_seq: int) -> None:
+        self._resident_event_seq_by_key[key] = event_seq
+        self._resident_event_order.append((key, event_seq))
+        while len(self._resident_event_order) > self._tombstone_limit:
+            expired_key, expired_seq = self._resident_event_order.popleft()
+            if self._resident_event_seq_by_key.get(expired_key) == expired_seq:
+                self._resident_event_seq_by_key.pop(expired_key, None)
+
+    def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool:
+        if completion_tokens < 0 or event_seq <= 0 or capacity_generation < 0:
+            raise ValueError("observation accounting fields are invalid")
+        if (
+            observation.request_id != routing_context.request_id
+            or observation.dispatch_id != routing_context.dispatch_id
+            or observation.owner_epoch != routing_context.owner_epoch
+            or not self._owner_is_active(observation.owner_epoch)
+            or capacity_generation != self._capacity_generation
+        ):
+            return False
+        serving_weight_version = observation.serving_weight_version or routing_context.serving_weight_version
+        if (
+            serving_weight_version is None
+            or (
+                routing_context.serving_weight_version is not None
+                and serving_weight_version != routing_context.serving_weight_version
+            )
+            or self._capacity_view(serving_weight_version=serving_weight_version) is None
+        ):
+            return False
+        key = (routing_context.owner_epoch, routing_context.engine_session_id)
+        if event_seq <= self._resident_event_seq_by_key.get(key, 0):
+            return False
+        prompt_tokens = observation.prompt_tokens
+        if prompt_tokens is None:
+            prompt_tokens = routing_context.prompt_tokens
+        record = _ResidentContextRecord(
+            owner_epoch=routing_context.owner_epoch,
+            engine_session_id=routing_context.engine_session_id,
+            serving_weight_version=serving_weight_version,
+            context_tokens=prompt_tokens + completion_tokens,
+            event_seq=event_seq,
+            dispatch_id=routing_context.dispatch_id,
+            selected_worker_id=(observation.selected_worker_id if observation.has_complete_worker_receipt else None),
+            selected_engine_epoch=(
+                observation.selected_engine_epoch if observation.has_complete_worker_receipt else None
+            ),
+            actual_cached_tokens=observation.actual_cached_tokens,
+        )
+        self._resident_contexts[key] = record
+        self._remember_resident_event(key=key, event_seq=event_seq)
+        self._availability_seq += 1
+        return True
+
+    def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool:
+        if owner_epoch <= 0 or not engine_session_id or event_seq <= 0:
+            raise ValueError("resident invalidation fields are invalid")
+        if not self._owner_is_active(owner_epoch):
+            return False
+        key = (owner_epoch, engine_session_id)
+        if event_seq <= self._resident_event_seq_by_key.get(key, 0):
+            return False
+        removed = self._resident_contexts.pop(key, None) is not None
+        self._remember_resident_event(key=key, event_seq=event_seq)
+        if removed:
+            self._availability_seq += 1
+        return True
+
     def availability_seq(self) -> int:
         self._sweep_expired()
         self._observe_snapshot_staleness()
@@ -575,6 +725,8 @@ class AdmissionBudgetCoordinatorCore:
             "active_leases": len(self._leases_by_key),
             "in_flight_leases": sum(1 for lease in self._leases_by_key.values() if lease.activated),
             "reserved_tokens": sum(lease.routing_context.reservation_tokens for lease in self._leases_by_key.values()),
+            "resident_contexts": len(self._resident_contexts),
+            "resident_tokens": sum(record.context_tokens for record in self._resident_contexts.values()),
             "tombstones": len(self._tombstone_expiry_by_key),
             "snapshot_source_id": None if batch is None else batch.source_id,
             "snapshot_source_open": False if batch is None else batch.source_open,
@@ -663,6 +815,36 @@ class AdmissionBudgetCoordinator:
         outcome: LeaseReleaseOutcome,
     ) -> None:
         self._core.release(lease=lease, outcome=outcome)
+
+    def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool:
+        return self._core.record_route_observation(
+            routing_context=routing_context,
+            observation=observation,
+            completion_tokens=completion_tokens,
+            event_seq=event_seq,
+            capacity_generation=capacity_generation,
+        )
+
+    def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool:
+        return self._core.invalidate_resident_context(
+            owner_epoch=owner_epoch,
+            engine_session_id=engine_session_id,
+            event_seq=event_seq,
+        )
 
     def availability_seq(self) -> int:
         return self._core.availability_seq()
@@ -908,3 +1090,47 @@ class RayAdmissionBudgetPort:
         availability_seq = await self._await_rpc(self._coordinator.availability_seq.remote())
         self._availability_seq = max(self._availability_seq, int(availability_seq))
         return self._availability_seq
+
+    async def record_route_observation(
+        self,
+        *,
+        routing_context: RoutingContext,
+        observation: RouteObservation,
+        completion_tokens: int,
+        event_seq: int,
+        capacity_generation: int,
+    ) -> bool:
+        try:
+            return bool(
+                await self._await_rpc(
+                    self._coordinator.record_route_observation.remote(
+                        routing_context=routing_context,
+                        observation=observation,
+                        completion_tokens=completion_tokens,
+                        event_seq=event_seq,
+                        capacity_generation=capacity_generation,
+                    )
+                )
+            )
+        except (ray.exceptions.RayActorError, ray.exceptions.TaskCancelledError, TimeoutError):
+            return False
+
+    async def invalidate_resident_context(
+        self,
+        *,
+        owner_epoch: int,
+        engine_session_id: str,
+        event_seq: int,
+    ) -> bool:
+        try:
+            return bool(
+                await self._await_rpc(
+                    self._coordinator.invalidate_resident_context.remote(
+                        owner_epoch=owner_epoch,
+                        engine_session_id=engine_session_id,
+                        event_seq=event_seq,
+                    )
+                )
+            )
+        except (ray.exceptions.RayActorError, ray.exceptions.TaskCancelledError, TimeoutError):
+            return False

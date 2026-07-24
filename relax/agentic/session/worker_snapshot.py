@@ -324,6 +324,20 @@ class WorkerSnapshotPublisherCore:
                     serving_weight_version=sample.consensus_weight_version,
                     source_open=sample.batch.source_open,
                     complete=sample.batch.complete,
+                    worker_namespace=(
+                        tuple(
+                            sorted(
+                                (
+                                    snapshot.worker_id,
+                                    snapshot.engine_epoch,
+                                    snapshot.serving_weight_version,
+                                )
+                                for snapshot in sample.batch.snapshots
+                            )
+                        )
+                        if sample.batch.complete
+                        else None
+                    ),
                 )
                 for shard in self._shards
             ),
