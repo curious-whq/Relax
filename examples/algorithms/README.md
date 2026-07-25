@@ -11,6 +11,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 | 算法      | 启用参数                      | 推荐场景                   |
 | --------- | ----------------------------- | -------------------------- |
 | **GRPO**  | `--advantage-estimator grpo`  | 默认、大多数场景           |
+| **GDPO**  | `--advantage-estimator gdpo`  | 多奖励独立归一化           |
 | **CISPO** | `--advantage-estimator cispo` | 保留梯度方向、需要更高精度 |
 | **GSPO**  | `--advantage-estimator gspo`  | 序列级约束、稳定训练       |
 | **SAPO**  | `--advantage-estimator sapo`  | 平滑优化、soft 信任域      |
@@ -28,6 +29,13 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - 对超出信任域的 token 保留梯度方向（仅限幅）
 - 梯度方差较大，需配合 `--kl-loss-coef 0.001` 稳定训练
 - 适合需要更精细学习信号的任务
+
+### GDPO（多奖励）
+
+- 分别对每个奖励做组内标准化，再合并 advantage
+- 对合并结果做序列 batch 级标准化
+- 最小示例同时使用 `correctness` 和 `format`：
+  `bash examples/algorithms/run-qwen3-4B-8xgpu-gdpo.sh`
 
 ### GSPO（序列级 KL 约束）
 
@@ -115,13 +123,13 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ### 通用参数
 
-| 参数                    | 默认值               | 说明                                                                                                    |
-| ----------------------- | -------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
-| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                             |
-| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                        |
-| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                    |
-| `--kl-coef`             | `0.0`                | KL 惩罚系数（PPO、REINFORCE++ 等用）                                                                    |
+| 参数                    | 默认值               | 说明                                                                      |
+| ----------------------- | -------------------- | ------------------------------------------------------------------------- |
+| `--advantage-estimator` | `grpo`               | 算法类型由算法注册表提供，包括 `grpo`、`gdpo`、`cispo`、`gspo`、`sapo` 等 |
+| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                               |
+| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                          |
+| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                      |
+| `--kl-coef`             | `0.0`                | KL 惩罚系数（PPO、REINFORCE++ 等用）                                      |
 
 ### CISPO 专用参数
 
@@ -190,6 +198,8 @@ GSPO_ARGS=(
 ```
 examples/algorithms/
 ├── README.md                              (本文件)
+├── gdpo_reward.py                         (correctness + format 奖励)
+├── run-qwen3-4B-8xgpu-gdpo.sh             (GDPO 最小训练示例)
 ├── run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh    (CISPO 多模态示例)
 ├── ... (其他算法脚本)
 ```

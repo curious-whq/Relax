@@ -272,7 +272,7 @@
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | 优势估计器。注意：OPD 现在独立于优势估计器，使用 `--opd-kl-coef > 0` 在任何估计器上启用 OPD |
+| `--advantage-estimator` | str | grpo | 注册名称，例如 `grpo`、`gdpo`、`gspo`、`sapo` 或 `cispo` | 优势估计器，可选值由算法注册表派生 |
 | `--normalize-advantages` | flag | False | - | 是否归一化优势 |
 | `--disable-grpo-std-normalization` | flag | - | - | 禁用 GRPO 标准差归一化（来自 [Dr.GRPO](https://arxiv.org/pdf/2503.20783)） |
 | `--disable-rewards-normalization` | flag | - | - | 禁用 reward 归一化 |
@@ -422,6 +422,8 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
 | `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
+| `--reward-keys` | list[str] | None | GDPO 等多奖励算法使用的独立 reward key |
+| `--reward-weights` | list[float] | None | 与 `--reward-keys` 一一对应的可选权重 |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |
 | `--rm-url` | str | None | 远程 Reward 模型服务 URL（用于 `--rm-type remote_rm`） |

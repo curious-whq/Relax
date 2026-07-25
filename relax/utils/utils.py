@@ -11,6 +11,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.core.registry import get_algorithm
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -132,8 +133,8 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     # populate this field for a subset of samples (e.g. SWE but not code).
     if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
         train_data["raw_reward"] = [
-            sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
-            for sample in samples
+            sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else raw_rewards[i]
+            for i, sample in enumerate(samples)
         ]
 
     # For rollout buffer
@@ -177,36 +178,8 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
         return custom_reward_post_process_func(args, samples)
 
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
-        and args.rewards_normalization
-    ):
-        # group norm
-        rewards = torch.tensor(raw_rewards, dtype=torch.float)
-        positions_by_group: dict[int, list[int]] = {}
-        for position, sample in enumerate(samples):
-            if sample.group_index is None:
-                raise ValueError("Sample.group_index is required for group reward normalization.")
-            if sample.group_index not in positions_by_group:
-                positions_by_group[sample.group_index] = []
-            positions_by_group[sample.group_index].append(position)
-
-        normalized_rewards = torch.empty_like(rewards)
-        for group_index, positions in positions_by_group.items():
-            if len(positions) != args.n_samples_per_prompt:
-                raise ValueError(
-                    f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
-                )
-            group_rewards = rewards[positions]
-            group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
-                group_rewards = group_rewards / (group_rewards.std() + 1e-6)
-            normalized_rewards[positions] = group_rewards
-
-        return raw_rewards, normalized_rewards.tolist()
-
-    return raw_rewards, raw_rewards
+    spec = get_algorithm(args.advantage_estimator)
+    return spec.resolve_reward_processor()(args, samples)
 
 
 def dict_to_tensordict(
@@ -425,9 +398,10 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     data = [Sample.from_dict(sample) for sample in data]
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
+        spec = get_algorithm(args.advantage_estimator)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+            and spec.capabilities.requires_complete_groups
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

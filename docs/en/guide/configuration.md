@@ -272,7 +272,7 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | Advantage estimator. Note: OPD is now independent of advantage estimator; enable OPD on any estimator with `--opd-kl-coef > 0` |
+| `--advantage-estimator` | str | grpo | Registered name, such as `grpo`, `gdpo`, `gspo`, `sapo`, or `cispo` | Advantage estimator. Available choices are derived from the algorithm registry |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -422,6 +422,8 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | `--rm-type` | str | None | Built-in reward model type |
 | `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
+| `--reward-keys` | list[str] | None | Independent reward keys used by multi-reward algorithms such as GDPO |
+| `--reward-weights` | list[float] | None | Optional weights corresponding one-to-one with `--reward-keys` |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
 | `--group-rm` | flag | False | Whether to compute reward for entire group |
 | `--rm-url` | str | None | Remote reward model service URL (for `--rm-type remote_rm`) |

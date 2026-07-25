@@ -11,6 +11,7 @@ from sglang_router.launch_router import RouterArgs
 
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.core.registry import get_algorithm, registered_algorithm_names
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
@@ -1456,15 +1457,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--advantage-estimator",
                 type=str,
-                choices=[
-                    "grpo",
-                    "gspo",
-                    "reinforce_plus_plus",
-                    "reinforce_plus_plus_baseline",
-                    "ppo",
-                    "sapo",
-                    "cispo",
-                ],
+                choices=registered_algorithm_names(),
                 default="grpo",
                 help=(
                     "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
@@ -1938,6 +1931,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Some reward model may return a dict instead of a value, "
                     "this is the key to extract the reward value from the dict. "
+                ),
+            )
+            parser.add_argument(
+                "--reward-keys",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Reward keys used by registered multi-reward algorithms. "
+                    "GDPO requires at least two keys, for example: --reward-keys correctness format."
+                ),
+            )
+            parser.add_argument(
+                "--reward-weights",
+                type=float,
+                nargs="+",
+                default=None,
+                help=(
+                    "Optional weights for --reward-keys. Values are applied after each reward is normalized; "
+                    "defaults to equal weights."
                 ),
             )
             parser.add_argument(
@@ -2448,6 +2461,17 @@ def slime_validate_args(args):
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
+    # Apply file-based overrides before deriving or validating any dependent
+    # configuration. In particular, the registered algorithm capabilities must
+    # describe the final estimator selected by the merged configuration.
+    if args.custom_config_path:
+        with open(args.custom_config_path) as f:
+            data = yaml.safe_load(f) or {}
+        for k, v in data.items():
+            if hasattr(args, k):
+                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
+            setattr(args, k, v)
+
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
@@ -2591,13 +2615,17 @@ def slime_validate_args(args):
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
     if not is_sft:
-        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
+        algorithm = get_algorithm(args.advantage_estimator)
+        if algorithm.capabilities.requires_advantage_whitening:
             assert args.normalize_advantages, (
-                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-                "require advantage normalization. Please add `--normalize-advantages` to your command."
+                f"The {args.advantage_estimator!r} advantage estimator requires advantage normalization. "
+                "Please add `--normalize-advantages` to your command."
             )
 
         if args.fully_async:
+            assert algorithm.capabilities.supports_fully_async, (
+                f"The {args.advantage_estimator!r} advantage estimator does not support fully-async mode."
+            )
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
                 "Please remove --normalize-advantages from your command."
@@ -2736,7 +2764,7 @@ def slime_validate_args(args):
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    args.use_critic = get_algorithm(args.advantage_estimator).capabilities.uses_critic
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -2965,14 +2993,6 @@ def slime_validate_args(args):
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
-    if args.custom_config_path:
-        with open(args.custom_config_path) as f:
-            data = yaml.safe_load(f) or {}
-        for k, v in data.items():
-            if hasattr(args, k):
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
-            setattr(args, k, v)
-
     if args.eval_max_context_len is None:
         logger.info(
             f"args.eval_max_context_len is not set. Use args.rollout_max_context_len {args.rollout_max_context_len} as default value."
@@ -2997,12 +3017,11 @@ def slime_validate_args(args):
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
 
-    if args.advantage_estimator == "ppo":
-        raise ValueError(
-            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
-            "Please use one of the following advantage estimators instead: "
-            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
-        )
+    algorithm = get_algorithm(args.advantage_estimator)
+    algorithm.validate(args)
+    args.use_critic = algorithm.capabilities.uses_critic
+    if args.eval_reward_key is None:
+        args.eval_reward_key = args.reward_key
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."

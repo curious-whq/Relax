@@ -22,6 +22,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
+from relax.core.registry import get_algorithm
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
@@ -50,6 +51,7 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.tracking_utils import init_tracking
+from relax.utils.training.algorithm_ops import reward_group_has_variance, reward_vector_label
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
     save_eval_summary_jsonl,
@@ -3985,18 +3987,20 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
 
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]):
-    # only compute in GRPO-like algorithms where one prompt has multiple responses
-    if args.advantage_estimator == "ppo":
+    spec = get_algorithm(args.advantage_estimator)
+    if not spec.capabilities.reports_group_reward_variance:
         return {}
 
-    def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
+    reward_extractor = spec.resolve_reward_extractor()
 
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
-    interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
+    interesting_sample_groups = [
+        group for group in all_sample_groups.values() if not reward_group_has_variance(args, group, reward_extractor)
+    ]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
+    interesting_rewards = [
+        reward_vector_label(args, group[0], reward_extractor) for group in interesting_sample_groups
+    ]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 

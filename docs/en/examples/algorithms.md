@@ -42,6 +42,63 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ---
 
+## GDPO
+
+GDPO extends group-relative optimization to multiple independent rewards. It prevents one reward dimension from
+dominating merely because it has a larger scale.
+
+### How It Works
+
+For every prompt group, GDPO standardizes each configured reward independently:
+
+$$z_{i,k} = \frac{r_{i,k} - \mu_{g,k}}{\sigma_{g,k} + 10^{-4}}$$
+
+It then combines the standardized rewards with optional weights and standardizes the resulting scalar once more
+across the sequence batch:
+
+$$a_i^\text{group} = \sum_k w_k z_{i,k}, \qquad
+\hat{A}_i = \frac{a_i^\text{group} - \mu_\text{batch}}
+{\sigma_\text{batch} + 10^{-4}}$$
+
+Both standard deviations use sample statistics. A zero-variance reward dimension contributes zero. The final
+sequence advantage is broadcast to its response tokens.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--advantage-estimator gdpo` | — | Enable GDPO |
+| `--reward-keys` | — | Two or more keys returned by the reward function |
+| `--reward-weights` | all `1.0` | Optional weights, one per reward key |
+| `--reward-key` | first reward key | Primary raw reward used by existing logging and evaluation paths |
+
+GDPO requires `global_batch_size` to be divisible by `n_samples_per_prompt`. The current implementation also
+requires `rollout_batch_size * n_samples_per_prompt == global_batch_size`, so one rollout is exactly one batch-wise
+normalization window.
+
+### Quick Start
+
+The minimal example returns independent `correctness` and `format` rewards:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+EXP_DIR=/path/to/exp \
+bash examples/algorithms/run-qwen3-4B-8xgpu-gdpo.sh
+```
+
+The essential configuration is:
+
+```bash
+--custom-rm-path examples.algorithms.gdpo_reward.reward_func
+--advantage-estimator gdpo
+--reward-key correctness
+--reward-keys correctness format
+--reward-weights 1.0 1.0
+```
+
+---
+
 ## CISPO
 
 CISPO (Clipped Importance-ratio Soft Policy Optimization) preserves gradient signal for out-of-trust-region tokens instead of zeroing it out. It caps gradient magnitude via a stop-gradient'd coefficient while keeping the gradient direction alive.
@@ -159,11 +216,29 @@ SAPO_ARGS=(
 
 ---
 
+## Adding a New Algorithm
+
+An algorithm is defined by one `AlgorithmSpec` in `relax/core/registry.py`. The spec registers five lazy hooks:
+
+1. reward extraction;
+2. reward post-processing;
+3. advantage estimation;
+4. policy-ratio construction;
+5. policy objective.
+
+Implement the hooks in a lightweight module, describe orchestration requirements with `AlgorithmCapabilities`, and
+register the spec with `register_algorithm()`. CLI choices, reward processing, training dispatch, and the Controller's
+service view are then derived from the registry. Add a validator when the algorithm has configuration invariants;
+do not add a new algorithm-name branch to the training flow.
+
+---
+
 ## Algorithm Comparison
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
 |-----------|----------------------|-------------|---------------|
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
+| **GDPO** | Per-reward group normalization, then batch normalization | PPO-Clip (hard clip) | Optional KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |

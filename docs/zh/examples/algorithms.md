@@ -42,6 +42,60 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ---
 
+## GDPO
+
+GDPO 将组相对优化扩展到多个相互独立的奖励维度，避免某个奖励仅因数值尺度更大而主导训练。
+
+### 算法原理
+
+对于每个 prompt 组，GDPO 分别标准化每个配置的奖励：
+
+$$z_{i,k} = \frac{r_{i,k} - \mu_{g,k}}{\sigma_{g,k} + 10^{-4}}$$
+
+然后使用可选权重合并各维度，并对合并后的标量做一次序列 batch 级标准化：
+
+$$a_i^\text{group} = \sum_k w_k z_{i,k}, \qquad
+\hat{A}_i = \frac{a_i^\text{group} - \mu_\text{batch}}
+{\sigma_\text{batch} + 10^{-4}}$$
+
+两次标准差都采用样本统计量。零方差的奖励维度贡献为零。最终的序列 advantage 会广播到对应 response token。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--advantage-estimator gdpo` | — | 启用 GDPO |
+| `--reward-keys` | — | 奖励函数返回的两个或更多 key |
+| `--reward-weights` | 全部为 `1.0` | 可选权重，数量必须与 reward key 一致 |
+| `--reward-key` | 第一个 reward key | 供现有日志和评测链路使用的主原始奖励 |
+
+GDPO 要求 `global_batch_size` 可被 `n_samples_per_prompt` 整除。当前实现还要求
+`rollout_batch_size * n_samples_per_prompt == global_batch_size`，确保一次 rollout 恰好对应一个 batch-wise
+归一化窗口。
+
+### 快速开始
+
+最小示例会分别返回 `correctness` 和 `format` 奖励：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+EXP_DIR=/path/to/exp \
+bash examples/algorithms/run-qwen3-4B-8xgpu-gdpo.sh
+```
+
+核心配置如下：
+
+```bash
+--custom-rm-path examples.algorithms.gdpo_reward.reward_func
+--advantage-estimator gdpo
+--reward-key correctness
+--reward-keys correctness format
+--reward-weights 1.0 1.0
+```
+
+---
+
 ## CISPO
 
 CISPO（Clipped Importance-ratio Soft Policy Optimization）对超出信任域的 token 保留梯度信号，而非将其清零。通过 stop-gradient 系数限制梯度幅度，同时保留梯度方向。
@@ -159,11 +213,28 @@ SAPO_ARGS=(
 
 ---
 
+## 接入新算法
+
+每个算法由 `relax/core/registry.py` 中的一个 `AlgorithmSpec` 描述。该 spec 注册五个懒加载 hook：
+
+1. 奖励提取；
+2. 奖励后处理；
+3. advantage 计算；
+4. 策略 ratio 构造；
+5. 策略目标函数。
+
+在轻量模块中实现这些 hook，通过 `AlgorithmCapabilities` 描述编排要求，再调用 `register_algorithm()`
+注册。命令行选项、奖励处理、训练分发和 Controller 服务视图都会从注册表派生。算法存在配置不变量时，
+应额外注册 validator；不要在训练流程中新增算法名称分支。
+
+---
+
 ## 算法对比
 
 | 算法 | Advantage 计算 | 策略损失 | KL 约束方式 |
 |------|---------------|---------|-----------|
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
+| **GDPO** | 各奖励组内归一化，再做 batch 归一化 | PPO-Clip（硬裁剪） | 可选 KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |

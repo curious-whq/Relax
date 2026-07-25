@@ -19,6 +19,7 @@ from relax.agentic.pipeline.runtime import (
     get_agentic_runtime_resources,
 )
 from relax.agentic.profile import TRACE_KEY
+from relax.core.registry import get_algorithm
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.logging_utils import get_logger
@@ -31,6 +32,7 @@ from relax.utils.metrics.metric_utils import (
 )
 from relax.utils.misc import group_by
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.training.algorithm_ops import reward_group_has_variance, reward_vector_label
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data, save_rollout_result_jsonl
 from relax.utils.types import Sample
@@ -1292,16 +1294,19 @@ def _dict_add_prefix(d, prefix):
 
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
-    if args.advantage_estimator == "ppo":
+    spec = get_algorithm(args.advantage_estimator)
+    if not spec.capabilities.reports_group_reward_variance:
         return {}
 
-    def _is_zero_std(samples: list[Sample]) -> bool:
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == reward for reward in rewards)
+    reward_extractor = spec.resolve_reward_extractor()
 
     all_sample_groups = group_by(all_samples, lambda sample: sample.group_index)
-    interesting_sample_groups = [group for group in all_sample_groups.values() if _is_zero_std(group)]
-    interesting_rewards = [str(round(group[0].get_reward_value(args), 1)) for group in interesting_sample_groups]
+    interesting_sample_groups = [
+        group for group in all_sample_groups.values() if not reward_group_has_variance(args, group, reward_extractor)
+    ]
+    interesting_rewards = [
+        reward_vector_label(args, group[0], reward_extractor) for group in interesting_sample_groups
+    ]
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 

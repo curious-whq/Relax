@@ -6,23 +6,21 @@ from typing import Any, Dict
 
 import torch
 import transfer_queue as tq
-from megatron.core import mpu
 from ray import serve
 from tensordict import TensorDict
 
 from relax.components.base import Base
+from relax.core.registry import get_algorithm
 from relax.utils.async_utils import run as run_
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
     consume_opd_advantage_data,
 )
-from relax.utils.training.ppo_utils import (
-    compute_approx_kl,
-    get_advantages_and_returns_batch,
-    get_grpo_returns,
-    get_reinforce_plus_plus_baseline_advantages,
-    get_reinforce_plus_plus_returns,
+from relax.utils.training.algorithm_ops import (
+    AdvantageContext,
+    standardize_sequence_batch,
 )
+from relax.utils.training.ppo_utils import compute_approx_kl
 
 
 @serve.deployment
@@ -67,6 +65,7 @@ class Advantages(Base):
                 )
 
                 while not run_(_drain_check("compute_advantages_and_returns", f"train_{step}")):
+                    algorithm = get_algorithm(self.config.advantage_estimator)
                     adv_data_fields = [
                         "tokens",
                         "total_lengths",
@@ -82,10 +81,15 @@ class Advantages(Base):
                     if self.config.kl_coef != 0 or self.config.use_kl_loss:
                         adv_data_fields.append("ref_log_probs")
                     consume_opd_advantage_data(adv_data_fields, self.config)
+                    batch_size = (
+                        self.config.global_batch_size
+                        if algorithm.capabilities.performs_batch_advantage_normalization
+                        else self.config.global_batch_size // self.config.num_iters_per_train_update
+                    )
                     batch_meta = run_(
                         self.data_system_client.async_get_meta(
                             data_fields=adv_data_fields,
-                            batch_size=self.config.global_batch_size // self.config.num_iters_per_train_update,
+                            batch_size=batch_size,
                             partition_id=f"train_{step}",
                             task_name="compute_advantages_and_returns",
                         )  # type: ignore
@@ -93,6 +97,11 @@ class Advantages(Base):
 
                     if batch_meta.size == 0:
                         continue
+                    if algorithm.capabilities.performs_batch_advantage_normalization and batch_meta.size != batch_size:
+                        raise RuntimeError(
+                            f"{algorithm.name} requires a complete normalization batch of {batch_size} samples, "
+                            f"but TransferQueue returned {batch_meta.size}."
+                        )
                     rollout_data = run_(self.data_system_client.async_get_data(batch_meta))
                     self._logger.info(
                         f"Successfully got rollout_id: {step} data from transfer queue for compute advantages and returns."
@@ -114,9 +123,8 @@ class Advantages(Base):
         `self.config.advantage_estimator`.
 
         This function extracts rewards, log-probs, values, and masks from
-        `rollout_data`, computes KL divergences, then applies the chosen advantage
-        estimator. Supported methods: "grpo", "gspo", "sapo", "ppo",
-        "reinforce_plus_plus", and "reinforce_plus_plus_baseline".
+        `rollout_data`, computes KL divergences, then dispatches to the registered
+        advantage estimator.
 
         Early returns if both `log_probs` and `values` are None (intermediate
         pipeline stages).
@@ -162,50 +170,21 @@ class Advantages(Base):
                 for i in range(len(log_probs))
             ]
 
-        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            returns = get_grpo_returns(rewards, kl)
-            advantages = list(returns)  # make a copy
-
-        elif self.config.advantage_estimator == "ppo":
-            # TODO: optimize this
-            old_rewards = rewards
-            rewards = []
-            for reward, k in zip(old_rewards, kl, strict=False):
-                k *= -self.config.kl_coef
-                cp_rank = mpu.get_context_parallel_rank()
-                if cp_rank == 0:
-                    k[-1] += reward
-                rewards.append(k)
-            advantages, returns = get_advantages_and_returns_batch(
-                total_lengths, response_lengths, values, rewards, self.config.gamma, self.config.lambd
-            )
-
-        elif self.config.advantage_estimator == "reinforce_plus_plus":
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            returns = get_reinforce_plus_plus_returns(
+        spec = get_algorithm(self.config.advantage_estimator)
+        result = spec.resolve_advantage_estimator()(
+            AdvantageContext(
+                args=self.config,
                 rewards=rewards,
                 kl=kl,
-                loss_masks=loss_masks,
+                values=values,
                 response_lengths=response_lengths,
-                total_lengths=total_lengths,
-                kl_coef=self.config.kl_coef,
-                gamma=self.config.gamma,
-            )
-            advantages = list(returns)
-
-        elif self.config.advantage_estimator == "reinforce_plus_plus_baseline":
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            advantages = get_reinforce_plus_plus_baseline_advantages(
-                rewards=rewards,
-                kl=kl,
                 loss_masks=loss_masks,
-                kl_coef=self.config.kl_coef,
+                total_lengths=total_lengths,
+                cp_rank=0,
+                batch_standardize=standardize_sequence_batch,
             )
-            returns = advantages
-
-        else:
-            raise NotImplementedError(f"advantage_estimator {self.config.advantage_estimator} is not supported. ")
+        )
+        advantages, returns = result.advantages, result.returns
 
         # Optional pure OPD mode: remove all non-OPD reward contribution.
         if getattr(self.config, "use_opd", False) and getattr(self.config, "opd_only_reward", False):
