@@ -1071,7 +1071,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
-    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
+    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch, *, actor_log_probs_precomputed: bool = False) -> None:
         """Run the ref/teacher/actor forward passes for a single hybrid sub-
         batch in place.
 
@@ -1112,9 +1112,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="teacher_")
                 )
 
-            # Actor forward
+            # Actor forward. The streaming hybrid path computes these log-probs
+            # while rollout is still producing this partition and stores them in
+            # TransferQueue keyed by sample metadata.
             self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-            if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+            if not actor_log_probs_precomputed and (
+                not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
+            ):
                 if self.args.use_routing_replay:
                     if self.args.use_rollout_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -1123,6 +1127,46 @@ class MegatronTrainRayActor(TrainRayActor):
                 sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
                 if self.args.use_rollout_routing_replay:
                     RoutingReplay.clear_all_forward()
+
+    def _should_stream_hybrid_actor_logprobs(self, rollout_id: int) -> bool:
+        """Choose one rank-consistent path before touching the partition.
+
+        If rollout already closed the partition there is no overlap window, so
+        retain the original full-batch path and avoid the extra TQ put/get.
+        """
+        if not getattr(self.args, "hybrid_stream_actor_logprobs", False) or self.args.debug_train_only:
+            return False
+
+        gloo_group = get_gloo_group()
+        should_stream = [False]
+        if dist.get_rank(group=gloo_group) == 0:
+            partition_complete = run(self.data_system_client.async_check_production_completed(f"train_{rollout_id}"))
+            should_stream[0] = not partition_complete
+        dist.broadcast_object_list(should_stream, src=0, group=gloo_group)
+
+        if dist.get_rank(group=gloo_group) == 0:
+            logger.info(
+                "Hybrid actor-logprob path for train_%s: %s",
+                rollout_id,
+                "streaming" if should_stream[0] else "full-batch fallback",
+            )
+        return should_stream[0]
+
+    def _stream_hybrid_actor_logprobs(self, rollout_id: int) -> None:
+        if self._active_model_tag != "actor":
+            self._switch_model("actor")
+
+        data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if self.args.multimodal_keys is not None:
+            data_fields.append("multimodal_train_inputs")
+
+        with inverse_timer("train_wait"), timer("hybrid_stream_actor_log_probs"):
+            self._streaming_fwd_putback(
+                rollout_id,
+                task_name="hybrid_actor_log_probs",
+                store_prefix="",
+                data_fields=data_fields,
+            )
 
     @staticmethod
     def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
@@ -1235,6 +1279,9 @@ class MegatronTrainRayActor(TrainRayActor):
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
         batch_size = plan.mini_local_sample_request
+        stream_actor_log_probs = self._should_stream_hybrid_actor_logprobs(rollout_id)
+        if stream_actor_log_probs:
+            self._stream_hybrid_actor_logprobs(rollout_id)
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
@@ -1278,6 +1325,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rewards",
                     "raw_reward",
                 ]
+                if stream_actor_log_probs:
+                    data_fields.append("log_probs")
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
@@ -1312,7 +1361,10 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"batch_index={batch_index - 1}: expected {batch_size}, "
                         f"got {len(sub_batch['total_lengths'])}."
                     )
-                self._hybrid_forward_subbatch(sub_batch)
+                self._hybrid_forward_subbatch(
+                    sub_batch,
+                    actor_log_probs_precomputed=stream_actor_log_probs,
+                )
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
 

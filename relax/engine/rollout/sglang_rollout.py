@@ -24,6 +24,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.ordered_publisher import OrderedAsyncTaskChain
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -777,6 +778,7 @@ async def generate_rollout_async(
     """
     timer = Timer()
     timer.start("rollout")
+    rollout_started_at = monotonic()
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
@@ -820,6 +822,8 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
+    eager_ready_offsets: list[float] = []
+    eager_publish_offsets: list[float] = []
     batch_to_transfer = []
     aborted_samples = []
     # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
@@ -856,6 +860,73 @@ async def generate_rollout_async(
         if is_final_backfill:
             return total_transfer_samples >= target_data_size
         return len(data) >= target_data_size
+
+    eager_group_publication = getattr(args, "hybrid_stream_actor_logprobs", False)
+    eager_transfer_group_count = max(compute_dp_size(args), 1) if eager_group_publication else 0
+    ordered_transfer_chain = OrderedAsyncTaskChain() if eager_group_publication else None
+
+    def schedule_transfer(groups: list, partition_rollout_id: int, *, is_last: bool) -> None:
+        """Schedule an eager transfer while preserving partition FIFO order."""
+        assert ordered_transfer_chain is not None
+        groups = list(groups)
+
+        async def ordered_transfer() -> None:
+            await transfer_batch_to_data_system(
+                args,
+                groups,
+                len(groups),
+                partition_rollout_id,
+                data_system_client,
+                is_last=is_last,
+            )
+
+            eager_publish_offsets.append(monotonic() - rollout_started_at)
+
+        transfer_task = ordered_transfer_chain.submit(ordered_transfer)
+        eager_ready_offsets.append(monotonic() - rollout_started_at)
+        transfer_tasks.append(transfer_task)
+
+    def flush_eager_transfers(*, force: bool) -> None:
+        nonlocal batch_to_transfer, committed_prev, committed_curr
+
+        if not eager_group_publication:
+            return
+        while batch_to_transfer and (force or len(batch_to_transfer) >= eager_transfer_group_count):
+            n = min(eager_transfer_group_count, len(batch_to_transfer))
+            if committed_prev < prev_target:
+                n = min(n, prev_target - committed_prev)
+                groups = batch_to_transfer[:n]
+                batch_to_transfer = batch_to_transfer[n:]
+                committed_prev += n
+                schedule_transfer(groups, rollout_id - 1, is_last=committed_prev >= prev_target)
+                logger.info(
+                    "Eager-published %s groups to train_%s (%s/%s)",
+                    n,
+                    rollout_id - 1,
+                    committed_prev,
+                    prev_target,
+                )
+                continue
+
+            if is_final_backfill:
+                raise RuntimeError(
+                    f"Final backfill for rollout_id={rollout_id} produced more than its target of {prev_target} groups"
+                )
+
+            n = min(n, curr_target - committed_curr)
+            if n <= 0:
+                raise RuntimeError(f"Eager transfer for rollout_id={rollout_id} exceeded current target {curr_target}")
+            groups = batch_to_transfer[:n]
+            batch_to_transfer = batch_to_transfer[n:]
+            committed_curr += n
+            schedule_transfer(groups, rollout_id, is_last=committed_curr >= curr_target)
+            logger.info(
+                "Eager-published %s groups to train_%s (%s/%s)",
+                n,
+                rollout_id,
+                committed_curr,
+                curr_target,
+            )
 
     # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
     # submissions whenever in-flight admitted groups drop below the commit target, each
@@ -923,6 +994,13 @@ async def generate_rollout_async(
             ):
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+
+        # The streaming Hybrid path publishes small, DP-wide waves through a
+        # FIFO task chain. Continue the generation loop immediately so SGLang
+        # can keep decoding while TransferQueue serializes the completed waves.
+        if eager_group_publication:
+            flush_eager_transfers(force=False)
+            continue
 
         # Only spawn a transfer task when there are samples to transfer.
         transfer_batch_size = (
@@ -995,7 +1073,9 @@ async def generate_rollout_async(
                         f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
                     )
 
-    if len(batch_to_transfer) > 0:
+    if eager_group_publication:
+        flush_eager_transfers(force=True)
+    elif len(batch_to_transfer) > 0:
         n = len(batch_to_transfer)
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
@@ -1118,6 +1198,14 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
+        if eager_publish_offsets:
+            rollout_metrics["perf_detail/rollout/eager_publish_count"] = len(eager_publish_offsets)
+            rollout_metrics["perf_detail/rollout/eager_first_ready_offset"] = eager_ready_offsets[0]
+            rollout_metrics["perf_detail/rollout/eager_first_publish_offset"] = eager_publish_offsets[0]
+            rollout_metrics["perf_detail/rollout/eager_last_publish_offset"] = eager_publish_offsets[-1]
+            rollout_metrics["perf_detail/rollout/eager_publish_span"] = (
+                eager_publish_offsets[-1] - eager_publish_offsets[0]
+            )
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"

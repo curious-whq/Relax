@@ -134,6 +134,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# Opt-in Task 22 experiment: publish completed GRPO groups early and overlap
+# Hybrid actor log-probability forward with the remaining rollout tail.
+if [[ "${HYBRID_STREAM_ACTOR_LOGPROBS:-0}" == "1" ]]; then
+   MISC_ARGS+=(--hybrid-stream-actor-logprobs)
+fi
+
    # --num-iters-per-train-update 4 \
    #  --use-health-check \
 mkdir -p log

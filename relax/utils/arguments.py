@@ -347,6 +347,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-stream-actor-logprobs",
+                action="store_true",
+                default=False,
+                help=(
+                    "In hybrid mode, publish completed GRPO groups early and stream the old-policy actor "
+                    "log-probability forward while rollout is still producing the partition. The full batch is "
+                    "still required before reference forward, advantages, training, and weight synchronization."
+                ),
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
@@ -2643,6 +2653,36 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
 
 
+def _validate_hybrid_stream_actor_logprobs(args) -> None:
+    if not getattr(args, "hybrid_stream_actor_logprobs", False):
+        return
+
+    if not args.hybrid:
+        raise ValueError("--hybrid-stream-actor-logprobs requires --hybrid.")
+    if not args.use_dynamic_batch_size:
+        raise ValueError("--hybrid-stream-actor-logprobs requires --use-dynamic-batch-size.")
+    if (
+        args.pipeline_model_parallel_size != 1
+        or (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) != 1
+    ):
+        raise ValueError("--hybrid-stream-actor-logprobs currently requires PP=1 and VPP=1.")
+    if args.num_iters_per_train_update != 1:
+        raise ValueError("--hybrid-stream-actor-logprobs currently requires --num-iters-per-train-update 1.")
+    if args.use_rollout_logprobs:
+        raise ValueError(
+            "--hybrid-stream-actor-logprobs is unnecessary with --use-rollout-logprobs because no actor "
+            "old-policy forward is consumed."
+        )
+    if getattr(args, "use_opd", False):
+        raise ValueError("--hybrid-stream-actor-logprobs does not yet support on-policy distillation.")
+    if getattr(args, "multimodal_keys", None) is not None:
+        raise ValueError("--hybrid-stream-actor-logprobs currently supports pure-text training only.")
+    if getattr(args, "keep_old_actor", False):
+        raise ValueError("--hybrid-stream-actor-logprobs does not yet support --keep-old-actor.")
+    if args.use_routing_replay or args.use_rollout_routing_replay:
+        raise ValueError("--hybrid-stream-actor-logprobs does not yet support routing replay.")
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -3074,6 +3114,8 @@ def slime_validate_args(args):
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
         )
+
+    _validate_hybrid_stream_actor_logprobs(args)
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."

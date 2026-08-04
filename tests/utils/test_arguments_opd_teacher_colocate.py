@@ -56,6 +56,57 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+def test_hybrid_stream_actor_logprobs_option_defaults_off(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    assert parser.parse_args([]).hybrid_stream_actor_logprobs is False
+    assert parser.parse_args(["--hybrid-stream-actor-logprobs"]).hybrid_stream_actor_logprobs is True
+
+
+def _hybrid_stream_args(**overrides) -> SimpleNamespace:
+    values = {
+        "hybrid_stream_actor_logprobs": True,
+        "hybrid": True,
+        "use_dynamic_batch_size": True,
+        "pipeline_model_parallel_size": 1,
+        "virtual_pipeline_model_parallel_size": None,
+        "num_iters_per_train_update": 1,
+        "use_rollout_logprobs": False,
+        "use_opd": False,
+        "multimodal_keys": None,
+        "keep_old_actor": False,
+        "use_routing_replay": False,
+        "use_rollout_routing_replay": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_hybrid_stream_actor_logprobs_accepts_supported_shape(arguments_module):
+    arguments_module._validate_hybrid_stream_actor_logprobs(_hybrid_stream_args())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"hybrid": False}, "requires --hybrid"),
+        ({"use_dynamic_batch_size": False}, "requires --use-dynamic-batch-size"),
+        ({"pipeline_model_parallel_size": 2}, "requires PP=1 and VPP=1"),
+        ({"num_iters_per_train_update": 2}, "requires --num-iters-per-train-update 1"),
+        ({"use_rollout_logprobs": True}, "unnecessary with --use-rollout-logprobs"),
+        ({"use_opd": True}, "does not yet support on-policy distillation"),
+        ({"multimodal_keys": ["image"]}, "supports pure-text training only"),
+        ({"keep_old_actor": True}, "does not yet support --keep-old-actor"),
+        ({"use_routing_replay": True}, "does not yet support routing replay"),
+    ],
+)
+def test_hybrid_stream_actor_logprobs_rejects_unsupported_shape(arguments_module, overrides, error):
+    with pytest.raises(ValueError, match=error):
+        arguments_module._validate_hybrid_stream_actor_logprobs(_hybrid_stream_args(**overrides))
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
