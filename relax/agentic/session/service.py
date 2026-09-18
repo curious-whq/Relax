@@ -1435,6 +1435,7 @@ class _SessionRecord:
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    adapter_binding: dict[str, Any] | None = None
 
     @property
     def interrupted(self) -> bool:
@@ -2101,6 +2102,9 @@ class AgenticSessionShard:
                     )
                 if int(sampling_params["max_new_tokens"]) > context_budget:
                     sampling_params["max_new_tokens"] = context_budget
+            if getattr(self.args, "lora_publication_url", None) and session.adapter_binding is None:
+                session.adapter_binding = await self._generation_backend.bind_adapter_session(session.session_id)
+                forest.static_metadata["lora_adapter"] = copy.deepcopy(session.adapter_binding)
             request_id = f"req_{session.session_id}_{session.next_ir_sequence}"
             session.next_ir_sequence += 1
             waiter = asyncio.get_running_loop().create_future()
@@ -2458,6 +2462,11 @@ class AgenticSessionShard:
                             audio_data=ir.history_backend_audio_data,
                             video_data=ir.history_backend_video_data,
                             return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                            **(
+                                {"adapter_binding": session.adapter_binding}
+                                if session.adapter_binding is not None
+                                else {}
+                            ),
                         )
                     finally:
                         mark_agentic_event(
@@ -2890,7 +2899,13 @@ class AgenticSessionShard:
                     name=f"session-finish:{session.session_id}",
                 )
                 session.finish_task = finish_task
-        return await asyncio.shield(finish_task)
+        try:
+            return await asyncio.shield(finish_task)
+        except Exception:
+            async with session.lock:
+                if session.finish_task is finish_task:
+                    session.finish_task = None  # Durable handoff failures remain retryable.
+            raise
 
     async def _finish_session_once(
         self,
@@ -2922,10 +2937,27 @@ class AgenticSessionShard:
 
         for runner_task in pre_backend_tasks:
             runner_task.cancel()
-        abort_outcomes = await asyncio.gather(
-            *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
-            return_exceptions=True,
-        )
+        if getattr(self.args, "lora_publication_url", None):
+            # Do not delete the Session if durable responsibility transfer fails.
+            # After transfer, local HTTP waiters no longer own physical execution.
+            try:
+                await self._generation_backend.close_adapter_session(session.session_id)
+            except Exception:
+                # Keep the Session record responsible for retry, but release the
+                # agent process even when the persistent spool is unavailable.
+                if resources is not None:
+                    await asyncio.gather(resources.process.terminate_and_join(), return_exceptions=True)
+                if process_wait is not None:
+                    process_wait.cancel()
+                raise
+            for runner_task in backend_tasks:
+                runner_task.cancel()
+            abort_outcomes = []
+        else:
+            abort_outcomes = await asyncio.gather(
+                *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
+                return_exceptions=True,
+            )
         await asyncio.gather(*pre_backend_tasks, *backend_tasks, return_exceptions=True)
         lifecycle_closed = True
         if self.args.agentic_session_lifecycle:
@@ -3010,6 +3042,17 @@ def create_agentic_session_shards(
     sglang_request_capacity = (
         config.sglang_server_concurrency * config.rollout_num_gpus // config.rollout_num_gpus_per_engine
     )
+    if getattr(config, "lora_publication_url", None):
+        import httpx
+
+        from relax.engine.lora.access import headers
+
+        with httpx.Client(timeout=10.0, trust_env=False, headers=headers()) as client:
+            response = client.get(config.lora_publication_url.rstrip("/") + "/state")
+            response.raise_for_status()
+            sglang_request_capacity = int(response.json()["generation_capacity"])
+            if sglang_request_capacity <= 0:
+                raise ValueError("publication cohort has no generation capacity")
     shard_entries: list[tuple[str, Any]] = []
     try:
         for placement in range(_DEFAULT_SESSION_SHARD_COUNT):

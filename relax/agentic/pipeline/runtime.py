@@ -15,6 +15,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from functools import partial
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeVar, cast
 
 import httpx
@@ -36,6 +37,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.utils.env import Envs
 from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -559,6 +561,35 @@ class SGLangBackendAdapter:
         self._args = args
         self._resources = load_agentic_compiler_resources(args)
         self._session_lifecycle = args.agentic_session_lifecycle
+        publication_url = getattr(args, "lora_publication_url", None)
+        from relax.engine.lora.access import headers as publication_headers
+        from relax.engine.lora.outbox import SessionCloseOutbox
+
+        self._publication_outbox = None
+        self._publication_owner = None
+        if publication_url:
+            if not Envs.RELAX_LORA_CLOSE_OUTBOX:
+                raise ValueError("RELAX_LORA_CLOSE_OUTBOX must name the shared persistent close spool")
+            self._publication_outbox = SessionCloseOutbox(Path(Envs.RELAX_LORA_CLOSE_OUTBOX), publication_url)
+            self._publication_owner = {"actor_id": ray.get_runtime_context().get_actor_id(), "epoch": uuid.uuid4().hex}
+        self._publication_client = (
+            httpx.AsyncClient(
+                base_url=publication_url.rstrip("/"),
+                timeout=10.0,
+                trust_env=False,
+                headers=publication_headers(),
+                limits=httpx.Limits(max_connections=8),
+            )
+            if publication_url
+            else None
+        )
+        self._publication_data = (
+            httpx.AsyncClient(
+                base_url=publication_url.rstrip("/"), timeout=35.0, trust_env=False, headers=publication_headers()
+            )
+            if publication_url
+            else None
+        )
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
             tokenizer=self._resources.tokenizer,
@@ -585,6 +616,7 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        adapter_binding: dict[str, Any] | None = None,
     ) -> BackendGenerateResult:
         payload = {
             "input_ids": input_ids,
@@ -600,16 +632,34 @@ class SGLangBackendAdapter:
             payload["audio_data"] = list(audio_data)
         if video_data:
             payload["video_data"] = video_data
-        if session_id and self._session_lifecycle:
-            # The full input_ids remain authoritative; session_id only tags
-            # the resulting radix leaves for terminal cleanup.
+        if session_id and (self._session_lifecycle or self._publication_client is not None):
+            # Full input_ids remain authoritative. The gateway uses session_id
+            # for version binding; native mode uses it as a KV lifecycle hint.
             payload["session_id"] = session_id
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            if self._publication_client is not None:
+                if not session_id or adapter_binding is None:
+                    raise RuntimeError("immutable LoRA generation requires a bound Session")
+                payload["expected_adapter"] = adapter_binding
+                # Each bounded transport wait observes the SAME logical request.
+                # Cancelling this waiter leaves close/outbox ownership intact.
+                while True:
+                    try:
+                        response = await self._publication_data.post("/generate", json=payload)
+                        if response.status_code == 503:
+                            await asyncio.sleep(0.2)
+                            continue
+                        response.raise_for_status()
+                        output = response.json()
+                        break
+                    except httpx.TransportError:
+                        await asyncio.sleep(0.2)
+            else:
+                output = await post(f"{self._router_url}/generate", payload, headers=headers)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
@@ -627,8 +677,39 @@ class SGLangBackendAdapter:
         )
 
     async def abort_request(self, request_id: str) -> None:
+        if self._publication_client is not None:
+            response = await self._publication_client.post("/abort_request", json={"rid": request_id})
+            response.raise_for_status()
+            return
         urls = await self._worker_urls()
         await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
+
+    async def bind_adapter_session(self, session_id: str) -> dict[str, Any]:
+        if self._publication_client is None:
+            raise RuntimeError("immutable LoRA gateway is not configured")
+        response = await self._publication_client.post(
+            "/bind_session",
+            json={
+                "session_id": session_id,
+                "owner": self._publication_owner,
+                "spool_id": self._publication_outbox.identity,
+                "spool_url": self._publication_outbox.gateway_url,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def close_adapter_session(self, session_id: str) -> None:
+        if self._publication_client is not None:
+            # Once this durable handoff succeeds, the gateway's independent spool
+            # consumer retains responsibility even if this Ray actor exits now.
+            path = await asyncio.to_thread(self._publication_outbox.enqueue, session_id)
+            try:
+                response = await self._publication_client.post("/close_session", json={"session_id": session_id})
+                response.raise_for_status()
+            except (httpx.HTTPError, OSError):
+                return
+            await asyncio.to_thread(self._publication_outbox.acknowledge, path)
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
@@ -668,6 +749,9 @@ class SGLangBackendAdapter:
         return router_worker_base_urls(response["urls"])
 
     async def shutdown(self) -> None:
+        if self._publication_client is not None:
+            await self._publication_client.aclose()
+            await self._publication_data.aclose()
         self._resources.shutdown()
 
 

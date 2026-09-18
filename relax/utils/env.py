@@ -324,6 +324,14 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Agentic runner -------------
     RELAX = EnvProperty("RELAX", str, None)
 
+    # ------------- Immutable LoRA publication and GPU verification -------------
+    RELAX_LORA_PUBLICATION_URL = EnvProperty("RELAX_LORA_PUBLICATION_URL", str, None)
+    RELAX_LORA_VERSION_PREFIX = EnvProperty("RELAX_LORA_VERSION_PREFIX", str, None)
+    RELAX_LORA_CLOSE_OUTBOX = EnvProperty("RELAX_LORA_CLOSE_OUTBOX", str, None)
+    RELAX_LORA_CONTROL_TOKEN = EnvProperty("RELAX_LORA_CONTROL_TOKEN", str, None)
+    RELAX_LORA_DATA_TOKEN = EnvProperty("RELAX_LORA_DATA_TOKEN", str, None)
+    RELAX_LORA_GPU_CONFIG = EnvProperty("RELAX_LORA_GPU_CONFIG", str, None)
+
     # ------------- Entrypoint / launcher scripts -------------
     # Set by scripts/entrypoint/*.sh; read back by the training scripts to
     # detect whether they were invoked through an entrypoint wrapper.

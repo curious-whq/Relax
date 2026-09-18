@@ -1561,6 +1561,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Prelaunch agent processes for the next rollout step.",
             )
             parser.add_argument(
+                "--lora-publication-url",
+                type=str,
+                default=None,
+                help="Immutable LoRA publication gateway URL for Agentic generation on dedicated frozen-base engines.",
+            )
+            parser.add_argument(
                 "--agentic-session-lifecycle",
                 action="store_true",
                 default=False,
@@ -3267,6 +3273,23 @@ def validate_save_lora_only_args(args) -> None:
 
 
 def _validate_agentic_rollout_args(args) -> None:
+    publication_url = getattr(args, "lora_publication_url", None)
+    if publication_url is not None:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(publication_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+            raise ValueError("--lora-publication-url must be an HTTP(S) gateway URL without query or fragment")
+        if not args.use_agentic_rollout:
+            raise ValueError("--lora-publication-url requires --use-agentic-rollout")
+        if getattr(args, "agentic_session_lifecycle", False):
+            raise ValueError(
+                "immutable LoRA manages Session references independently; omit --agentic-session-lifecycle"
+            )
+        if getattr(args, "agentic_program_admission", False):
+            raise ValueError(
+                "immutable LoRA uses dedicated engines; router-based --agentic-program-admission is unsupported"
+            )
     if not args.use_agentic_rollout:
         return
     args.rollout_function_path = "relax.agentic.rollout.generate_rollout"

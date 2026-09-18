@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from relax.agentic.pipeline import (
@@ -635,6 +636,7 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
+    adapter._publication_client = None
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
@@ -695,13 +697,64 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     assert posts == []
 
 
-async def test_terminal_session_closes_lifecycle_once() -> None:
+async def test_immutable_backend_routes_binding_generation_abort_and_close(monkeypatch, tmp_path) -> None:
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    binding = {"version_id": "A", "digest": "a" * 64, "lora_path": "relax_policy@A", "publication_epoch": 1}
+    calls = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if request.url.path == "/bind_session":
+            return httpx.Response(200, json=binding)
+        if request.url.path == "/generate":
+            assert body["expected_adapter"] == binding
+            assert body["session_id"] == "old"
+            return httpx.Response(
+                200,
+                json={
+                    "output_ids": [4],
+                    "meta_info": {"finish_reason": {"type": "stop"}, "lora_adapter": binding},
+                },
+            )
+        return httpx.Response(200, json={"success": True})
+
+    generic_post = AsyncMock(side_effect=AssertionError("immutable requests must not use router retries"))
+    monkeypatch.setattr(runtime_mod, "post", generic_post)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), base_url="http://gateway") as client:
+        from relax.engine.lora.outbox import SessionCloseOutbox
+
+        adapter._publication_client = client
+        adapter._publication_data = client
+        adapter._publication_owner = {"actor_id": "test-actor", "epoch": "test-epoch"}
+        adapter._publication_outbox = SessionCloseOutbox(tmp_path, "http://gateway")
+        assert await adapter.bind_adapter_session("old") == binding
+        for attempt in ("turn-1:0", "turn-1:1", "turn-2:0"):
+            output = await adapter.generate(
+                input_ids=[1, 2],
+                sampling_params={"max_new_tokens": 1},
+                session_id="old",
+                request_id=attempt,
+                adapter_binding=binding,
+            )
+            assert output.meta_info["lora_adapter"] == binding
+        await adapter.abort_request("turn-1:0")
+        await adapter.close_adapter_session("old")
+    assert calls[-2:] == [("/abort_request", {"rid": "turn-1:0"}), ("/close_session", {"session_id": "old"})]
+    generic_post.assert_not_called()
+
+
+@pytest.mark.parametrize("publication", [False, True])
+async def test_terminal_session_closes_lifecycle_once(publication) -> None:
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
-    shard.args = SimpleNamespace(agentic_session_lifecycle=True)
+    shard.args = SimpleNamespace(
+        agentic_session_lifecycle=not publication, lora_publication_url="http://gateway" if publication else None
+    )
     shard._generation_backend = SimpleNamespace(
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
+        close_adapter_session=AsyncMock(),
     )
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
@@ -725,8 +778,12 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
 
     assert await shard_cls._finish_session(shard, session, None) is None
     assert await shard_cls._finish_session(shard, session, None) is None
-    shard._generation_backend.close_session.assert_awaited_once()
-    assert shard._lifecycle_close_count == 1
+    if publication:
+        shard._generation_backend.close_adapter_session.assert_awaited_once_with("session-1")
+        shard._generation_backend.close_session.assert_not_awaited()
+    else:
+        shard._generation_backend.close_session.assert_awaited_once()
+    assert shard._lifecycle_close_count == int(not publication)
     assert shard._lifecycle_close_failure_count == 0
 
 
