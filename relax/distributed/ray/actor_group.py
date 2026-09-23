@@ -133,18 +133,27 @@ class RayTrainGroup:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
 
-    def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
+    def async_init(self, args, role, with_ref=False, with_opd_teacher=False, *, lora_export=None):
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
         self.args = args
         return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            actor.init.remote(
+                args,
+                role,
+                with_ref=with_ref,
+                with_opd_teacher=with_opd_teacher,
+                **({"lora_export": lora_export} if lora_export is not None else {}),
+            )
             for actor in self._actor_handlers
         ]
 
-    def async_train(self, rollout_id):
+    def async_train(self, rollout_id, *, lora_export=None):
         """Do one rollout training."""
-        return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
+        return [
+            actor.train.remote(rollout_id, **({"lora_export": lora_export} if lora_export is not None else {}))
+            for actor in self._actor_handlers
+        ]
 
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
@@ -154,17 +163,29 @@ class RayTrainGroup:
         """Compute actor log prob for routing replay."""
         return [actor.compute_actor_log_prob.remote(rollout_id) for actor in self._actor_handlers]
 
-    def train_fully_async(self, rollout_id):
+    def train_fully_async(self, rollout_id, *, lora_export=None):
         """Do one rollout training without ref log prob computation."""
-        return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
+        return [
+            actor.train_async.remote(rollout_id, **({"lora_export": lora_export} if lora_export is not None else {}))
+            for actor in self._actor_handlers
+        ]
 
-    def train_hybrid(self, rollout_id):
+    def train_hybrid(self, rollout_id, *, lora_export=None):
         """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
-        return [actor.train_hybrid.remote(rollout_id) for actor in self._actor_handlers]
+        return [
+            actor.train_hybrid.remote(rollout_id, **({"lora_export": lora_export} if lora_export is not None else {}))
+            for actor in self._actor_handlers
+        ]
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""
         ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+
+    def lora_export_result(self) -> dict:
+        results = ray.get([actor.lora_export_result.remote() for actor in self._actor_handlers])
+        if not results or results[0] is None or any(result != results[0] for result in results):
+            raise RuntimeError("adapter export did not return one consistent descriptor on all ranks")
+        return results[0]
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
